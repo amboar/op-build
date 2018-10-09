@@ -1,0 +1,1383 @@
+From 3e23a4ef97bc78aa8c8cf691407fdf9b8da30664 Mon Sep 17 00:00:00 2001
+From: Douglas Gilbert <dgilbert@us.ibm.com>
+Date: Wed, 29 Aug 2018 16:16:57 -0500
+Subject: [PATCH] Write firdata to PNOR over IPMI
+
+Change-Id: I50c586baf2c2cb2a83ffb30e81304eef3d65119c
+Reviewed-on: http://rchgit01.rchland.ibm.com/gerrit1/65953
+Reviewed-by: Martha Broyles <mbroyles@us.ibm.com>
+Reviewed-by: ANDREW R. JEFFERY <andrewrj@au1.ibm.com>
+Reviewed-by: William A. Bryan <wilbryan@us.ibm.com>
+Tested-by: William A. Bryan <wilbryan@us.ibm.com>
+---
+ src/occ_405/incl/common_types.h     |   2 +-
+ src/occ_405/occbuildname.c          |   2 +-
+ src/occ_gpe0/firdata/ast_mboxdd.c   | 197 ++++++-------
+ src/occ_gpe0/firdata/ast_mboxdd.h   |   2 +-
+ src/occ_gpe0/firdata/ipmidd.C       | 410 ++++++++++++++++++++++++++++
+ src/occ_gpe0/firdata/ipmidd.H       | 207 ++++++++++++++
+ src/occ_gpe0/firdata/mboxOverIpmi.C | 186 +++++++++++++
+ src/occ_gpe0/firdata/native.c       |   6 +-
+ src/occ_gpe0/firdata/native.h       |   3 +-
+ src/occ_gpe0/firdata/pnor_mboxdd.c  |  27 +-
+ src/occ_gpe0/img_defs.mk            |  28 +-
+ src/occ_gpe0/topfiles.mk            |   5 +-
+ 12 files changed, 960 insertions(+), 115 deletions(-)
+ create mode 100644 src/occ_gpe0/firdata/ipmidd.C
+ create mode 100644 src/occ_gpe0/firdata/ipmidd.H
+ create mode 100644 src/occ_gpe0/firdata/mboxOverIpmi.C
+
+diff --git a/src/occ_405/incl/common_types.h b/src/occ_405/incl/common_types.h
+index beab593e06eb..f932adf42dad 100755
+--- a/src/occ_405/incl/common_types.h
++++ b/src/occ_405/incl/common_types.h
+@@ -45,7 +45,7 @@ typedef int           INT;
+ typedef void          VOID;
+ 
+ // Skip this typedef in x86 environment
+-#ifndef OCC_X86_PARSER
++#if !defined(OCC_X86_PARSER) && !defined(__cplusplus)
+ typedef uint8_t       bool;
+ #endif
+ 
+diff --git a/src/occ_405/occbuildname.c b/src/occ_405/occbuildname.c
+index 10fdbe46e694..cbc30a63271f 100755
+--- a/src/occ_405/occbuildname.c
++++ b/src/occ_405/occbuildname.c
+@@ -34,6 +34,6 @@ volatile const char G_occ_buildname[16] __attribute__((section(".buildname"))) =
+ 
+ #else
+ 
+-volatile const char G_occ_buildname[16] __attribute__((section(".buildname"))) = /*<BuildName>*/  "op_occ_180904a\0"  /*</BuildName>*/ ;
++volatile const char G_occ_buildname[16] __attribute__((section(".buildname"))) = /*<BuildName>*/  "op_occ_180914a\0"  /*</BuildName>*/ ;
+ 
+ #endif
+diff --git a/src/occ_gpe0/firdata/ast_mboxdd.c b/src/occ_gpe0/firdata/ast_mboxdd.c
+index 397a01db8f2c..a9d2c24df769 100644
+--- a/src/occ_gpe0/firdata/ast_mboxdd.c
++++ b/src/occ_gpe0/firdata/ast_mboxdd.c
+@@ -37,6 +37,9 @@
+ #include <lpc.h>
+ #include <gpe_util.h>
+ 
++int ipmi_sendCommand(mboxMessage_t *io_msg, int i_arg_size);
++
++
+ errorHndl_t writeRegSIO(uint8_t i_regAddr, uint8_t i_data)
+ {
+     errorHndl_t l_err = NO_ERROR;
+@@ -105,7 +108,8 @@ errorHndl_t mboxIn(uint64_t i_addr, uint8_t *o_byte)
+                      len );
+ }
+ 
+-errorHndl_t doMessage( astMbox_t *io_mbox, mboxMessage_t *io_msg )
++
++errorHndl_t doMessage( astMbox_t *io_mbox, mboxMessage_t *io_msg, int i_arg_size )
+ {
+     uint8_t* l_data = (uint8_t*)io_msg;
+     errorHndl_t l_err = NO_ERROR;
+@@ -116,128 +120,137 @@ errorHndl_t doMessage( astMbox_t *io_mbox, mboxMessage_t *io_msg )
+ 
+     io_msg->iv_seq = io_mbox->iv_mboxMsgSeq++;
+ 
+-    do
++    //First try to send the message over IPMI
++    l_err = ipmi_sendCommand(io_msg, i_arg_size);
++
++    // If it didn't work then try to access the AST MBOX via LPC
++    // This is allowd for the case of an older BMC. Eventually it could
++    // be removed.
++    if(l_err)
+     {
+-        /* Write message out */
+-        for (i = 0; i < BMC_MBOX_DATA_REGS && !l_err; i++)
++        do
+         {
+-            l_err = mboxOut(i, l_data[i]);
+-        }
++            /* Write message out */
++            for (i = 0; i < BMC_MBOX_DATA_REGS && !l_err; i++)
++            {
++                l_err = mboxOut(i, l_data[i]);
++            }
+ 
+-        if ( l_err )
+-        {
+-            break;
+-        }
++            if ( l_err )
++            {
++                break;
++            }
+ 
+-        /* Clear status1 response bit as it was just set via reg write*/
+-        l_err = mboxOut(MBOX_STATUS_1, MBOX_STATUS1_RESP);
++            /* Clear status1 response bit as it was just set via reg write*/
++            l_err = mboxOut(MBOX_STATUS_1, MBOX_STATUS1_RESP);
+ 
+-        if ( l_err )
+-        {
+-            break;
+-        }
++            if ( l_err )
++            {
++                break;
++            }
+ 
+-        /* Ping BMC */
+-        l_err = mboxOut(MBOX_HOST_CTRL, MBOX_CTRL_INT_SEND);
++            /* Ping BMC */
++            l_err = mboxOut(MBOX_HOST_CTRL, MBOX_CTRL_INT_SEND);
+ 
+-        if ( l_err )
+-        {
+-            break;
+-        }
++            if ( l_err )
++            {
++                break;
++            }
+ 
+-        /* Wait for response */
+-        while ( l_loops++ < MBOX_MAX_RESP_WAIT_US && !l_err )
+-        {
+-            l_err = mboxIn(MBOX_STATUS_1, &l_stat1);
++            /* Wait for response */
++            while ( l_loops++ < MBOX_MAX_RESP_WAIT_US && !l_err )
++            {
++                l_err = mboxIn(MBOX_STATUS_1, &l_stat1);
++
++                if ( l_err )
++                {
++                    TRAC_ERR("doMessage error from MBOX_STATUS_1");
++                    break;
++                }
++
++                if ( l_stat1 & MBOX_STATUS1_RESP )
++                {
++                    break;
++                }
++
++                busy_wait(1000);
++            }
+ 
+             if ( l_err )
+             {
+-                TRAC_ERR("doMessage error from MBOX_STATUS_1");
++                TRAC_ERR( "Got error waiting for response !");
+                 break;
+             }
+ 
+-            if ( l_stat1 & MBOX_STATUS1_RESP )
++            if ( !(l_stat1 & MBOX_STATUS1_RESP) )
+             {
++                TRAC_ERR( "Timeout waiting for response !");
++
++                // Don't try to interrupt the BMC anymore
++                l_err = mboxOut(MBOX_HOST_CTRL, 0);
++                if ( l_err)
++                {
++                    //Note the command failed
++                    TRAC_ERR( "Error communicating with MBOX daemon");
++                    TRAC_ERR( "Mbox status 1 reg: %x", l_stat1);
++                }
++
++                // Tell the code below that we generated the error
++                //  (not an LPC error)
++                l_prot_error = true;
+                 break;
+             }
+ 
+-            busy_wait(1000);
+-        }
+-
+-        if ( l_err )
+-        {
+-            TRAC_ERR( "Got error waiting for response !");
+-            break;
+-        }
+-
+-        if ( !(l_stat1 & MBOX_STATUS1_RESP) )
+-        {
+-            TRAC_ERR( "Timeout waiting for response !");
+-
+-            // Don't try to interrupt the BMC anymore
+-            l_err = mboxOut(MBOX_HOST_CTRL, 0);
+-            if ( l_err)
++            /* Clear status */
++            l_err = mboxOut(MBOX_STATUS_1, MBOX_STATUS1_RESP);
++            if (l_err)
+             {
+-                //Note the command failed
+-                TRAC_ERR( "Error communicating with MBOX daemon");
+-                TRAC_ERR( "Mbox status 1 reg: %x", l_stat1);
++                TRAC_ERR( "Got error clearing status");
++                break;
+             }
+ 
+-            // Tell the code below that we generated the error
+-            //  (not an LPC error)
+-            l_prot_error = true;
+-            break;
+-        }
++            // Remember some message fields before they get overwritten
++            // by the response
++            uint8_t old_seq = io_msg->iv_seq;
+ 
+-        /* Clear status */
+-        l_err = mboxOut(MBOX_STATUS_1, MBOX_STATUS1_RESP);
+-        if (l_err)
+-        {
+-            TRAC_ERR( "Got error clearing status");
+-            break;
+-        }
++            // Read response
++            for (i = 0; i < BMC_MBOX_DATA_REGS && !l_err; i++)
++            {
++                l_err = mboxIn(i, &l_data[i]);
++            }
+ 
+-        // Remember some message fields before they get overwritten
+-        // by the response
+-        uint8_t old_seq = io_msg->iv_seq;
++            if ( l_err )
++            {
++                TRAC_ERR( "Got error reading response !");
++                break;
++            }
+ 
+-        // Read response
+-        for (i = 0; i < BMC_MBOX_DATA_REGS && !l_err; i++)
+-        {
+-            l_err = mboxIn(i, &l_data[i]);
+-        }
++            if (old_seq != io_msg->iv_seq)
++            {
++                TRAC_ERR( "bad sequence number in mbox message, got %d want %d",
++                          io_msg->iv_seq, old_seq);
++                l_err = -1;
++                break;
++            }
+ 
+-        if ( l_err )
+-        {
+-            TRAC_ERR( "Got error reading response !");
+-            break;
+-        }
++            if (io_msg->iv_resp != MBOX_R_SUCCESS)
++            {
++                TRAC_ERR( "BMC mbox command failed with err %d",
++                          io_msg->iv_resp);
++                l_err = -1;
++                // Tell code below that we generated the error (not an LPC error)
++                l_prot_error = true;
++                break;
++            }
+ 
+-        if (old_seq != io_msg->iv_seq)
+-        {
+-            TRAC_ERR( "bad sequence number in mbox message, got %d want %d",
+-                       io_msg->iv_seq, old_seq);
+-            l_err = -1;
+-            break;
+         }
++        while(0);
+ 
+-        if (io_msg->iv_resp != MBOX_R_SUCCESS)
++        // If we got an LPC error, commit it and generate our own
++        if ( l_err && !l_prot_error )
+         {
+-            TRAC_ERR( "BMC mbox command failed with err %d",
+-                       io_msg->iv_resp);
+             l_err = -1;
+-            // Tell code below that we generated the error (not an LPC error)
+-            l_prot_error = true;
+-            break;
+         }
+-
+-    }
+-    while(0);
+-
+-    // If we got an LPC error, commit it and generate our own
+-    if ( l_err && !l_prot_error )
+-    {
+-        l_err = -1;
+     }
+ 
+     return l_err;
+diff --git a/src/occ_gpe0/firdata/ast_mboxdd.h b/src/occ_gpe0/firdata/ast_mboxdd.h
+index 64ea40affbf8..81fcfa67e675 100644
+--- a/src/occ_gpe0/firdata/ast_mboxdd.h
++++ b/src/occ_gpe0/firdata/ast_mboxdd.h
+@@ -237,7 +237,7 @@ typedef struct {
+  *
+  *  @return Error from operation
+  */
+-errorHndl_t doMessage( astMbox_t *io_mbox, mboxMessage_t *io_msg );
++errorHndl_t doMessage( astMbox_t *io_mbox, mboxMessage_t *io_msg, int i_arg_size );
+ 
+ enum
+ {
+diff --git a/src/occ_gpe0/firdata/ipmidd.C b/src/occ_gpe0/firdata/ipmidd.C
+new file mode 100644
+index 000000000000..69bf42928ba7
+--- /dev/null
++++ b/src/occ_gpe0/firdata/ipmidd.C
+@@ -0,0 +1,410 @@
++/* IBM_PROLOG_BEGIN_TAG                                                   */
++/* This is an automatically generated prolog.                             */
++/*                                                                        */
++/* $Source: src/occ_405/firdata/ipmidd.C $                                */
++/*                                                                        */
++/* OpenPOWER OnChipController Project                                     */
++/*                                                                        */
++/* Contributors Listed Below - COPYRIGHT 2018                             */
++/* [+] International Business Machines Corp.                              */
++/*                                                                        */
++/*                                                                        */
++/* Licensed under the Apache License, Version 2.0 (the "License");        */
++/* you may not use this file except in compliance with the License.       */
++/* You may obtain a copy of the License at                                */
++/*                                                                        */
++/*     http://www.apache.org/licenses/LICENSE-2.0                         */
++/*                                                                        */
++/* Unless required by applicable law or agreed to in writing, software    */
++/* distributed under the License is distributed on an "AS IS" BASIS,      */
++/* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or        */
++/* implied. See the License for the specific language governing           */
++/* permissions and limitations under the License.                         */
++/*                                                                        */
++/* IBM_PROLOG_END_TAG                                                     */
++/**
++ *  @file ipmidd.c
++ *
++ *  @brief Implementation of the IPMI Device Driver
++ */
++
++/*****************************************************************************/
++// I n c l u d e s
++/*****************************************************************************/
++//#include <devicefw/driverif.H>
++//#include <trace/interface.H>
++
++
++extern "C" {
++
++#include "native.h"
++#include "lpc.h"
++#include "gpe_util.h"
++
++}
++
++#include "ipmidd.H"
++//#include "ipmirp.H"
++//#include <ipmi/ipmiif.H>
++//#include <initservice/initserviceif.H>
++//#include <util/align.H>
++
++//#include <config.h>
++
++//#include <sys/msg.h>
++//#include <errno.h>
++
++//#include <sys/time.h>
++//#include <sys/task.h>
++
++/*****************************************************************************/
++// D e f i n e s
++/*****************************************************************************/
++
++#if defined(IPMI_TRAC)
++#undef IPMI_TRAC
++#endif
++
++#define IPMI_TRAC(printf_string,args...) \
++    PK_TRACE(printf_string,##args)
++
++#define ERR_MRK "E>"
++#define INFO_MRK "I>"
++
++
++///////////////////////////////////////////////////////////////////////////////
++///////////////////////////////////////////////////////////////////////////////
++
++/**
++ * @brief Read an address from LPC space
++ */
++int IpmiDD::readLPC(const uint32_t i_addr, uint8_t& o_data)
++{
++    int rc = 0;
++    rc = lpc_read(LPC_TRANS_IO, i_addr,
++                  static_cast<uint8_t*>(&o_data),
++                  sizeof(uint8_t));
++    return rc;
++}
++
++/**
++ * @brief Write an address from LPC space
++ */
++int IpmiDD::writeLPC(const uint32_t i_addr,
++                            uint8_t i_data)
++{
++    int rc = 0;
++    rc = lpc_write(LPC_TRANS_IO,
++                   i_addr,
++                   static_cast<uint8_t*>(&i_data),
++                   sizeof(uint8_t));
++    return rc;
++}
++
++
++/**
++ * @brief Poll the control register
++ */
++int IpmiDD::pollCtrl(void)
++{
++    IPMI_TRAC(">>pollCtrl" );
++    int rc = 0;
++
++    uint8_t ctrl = 0;
++
++    rc = readLPC(REG_CONTROL, ctrl);
++
++    if (rc)
++    {
++        // Not sure there's much we can do here but trace.
++        // Likely a scom fail.
++        IPMI_TRAC(ERR_MRK "polling loop encountered an error."
++                  " rc = %d, exiting",rc);
++    }
++    else
++    {
++        if ((ctrl & IDLE_STATE) == 0)
++        {
++            rc = RC_IPMIDD_IDLE;
++        }
++        // If we see the B2H_ATN, there's a response waiting
++        else if (ctrl & CTRL_B2H_ATN)
++        {
++            rc = receive();
++        }
++
++        // If we see the SMS_ATN, there's an event waiting
++        else if (ctrl & CTRL_SMS_ATN)
++        {
++            IPMI_TRAC(INFO_MRK "sms/event");
++            receive();
++            //Not sure what to do about events or if we even need to handle them.
++            // Reject them all?
++
++            // Clear the SMS bit.
++            rc = writeLPC(REG_CONTROL, CTRL_SMS_ATN);
++
++            if (rc)
++            {
++                IPMI_TRAC(ERR_MRK "pollCtrl: IPMI SMS_ATN on, "
++                          "Clear failed rc = %d",rc);
++            }
++
++            // event was already traced in receive()
++            // caller can decide what to do with this
++            rc = RC_IPMI_EVENT;
++        }
++        else
++        {
++            rc = RC_IPMI_BUSY;
++        }
++    }
++    return rc;
++}
++
++/**
++ * @brief Performs a reset of the BT hardware
++ */
++inline int IpmiDD::reset(void)
++{
++    IPMI_TRAC("resetting the IPMI BT interface");
++    return writeLPC(REG_INTMASK, INT_BMC_HWRST);
++}
++
++/**
++ * @brief Performs an IPMI Message Write Operation
++ */
++int IpmiDD::send(void)
++{
++    int err = 0;
++    uint8_t    ctrl = 0;
++    int         l_len = iv_data_len + 3; // Add header size
++
++    do
++    {
++        err = readLPC(REG_CONTROL, ctrl);
++        if (err) { break; }
++
++        // If the interface isn't idle, tell the caller to come back
++        if ((ctrl & IDLE_STATE) != 0)
++        {
++            return RC_IPMIDD_NOT_IDLE;
++        }
++
++        // Tell the interface we're writing. Per p. 135 of the
++        // spec we *do not* set H_BUSY.
++        err = writeLPC(REG_CONTROL, CTRL_CLR_WR_PTR);
++        if (err)
++        {
++            break;
++        }
++
++        err = writeLPC(REG_HOSTBMC, l_len);
++        if (err)
++        {
++            break;
++        }
++
++        err = writeLPC(REG_HOSTBMC, iv_netfun);
++        if (err)
++        {
++            break;
++        }
++
++        err = writeLPC(REG_HOSTBMC, iv_seq);
++        if (err)
++        {
++            break;
++        }
++
++        err = writeLPC(REG_HOSTBMC, iv_cmd);
++        if (err)
++        {
++            break;
++        }
++
++
++        for( int i = 0; (i < iv_data_len) && (err == 0); ++i)
++        {
++            err = writeLPC(REG_HOSTBMC, iv_data[i]);
++            if (err)
++            {
++                break;
++            }
++        }
++        if (err)
++        {
++            break;
++        }
++
++        IPMI_TRAC("I> write %x:%x seq %x len %x",
++                  iv_netfun, iv_cmd, iv_seq,
++                  iv_data_len);
++
++        // If all is well, alert the host we sent bits.
++        err = writeLPC(REG_CONTROL, CTRL_H2B_ATN);
++        if (err)
++        {
++            break;
++        }
++
++    } while(false);
++
++    // If we have an error, try to reset the interface.
++    if (err)
++    {
++        reset();
++    }
++
++    return err;
++}
++
++/**
++ * @brief Read a response to an issued command, or an sms
++ */
++//int IpmiDD::receive(IPMI::BTMessage* o_msg)
++int IpmiDD::receive(void)
++{
++    int         err = 0;
++    int         l_len = 0;
++    uint8_t     ctrl = 0;
++    bool        marked_busy = false;
++    uint8_t     byte = 0;
++
++    do
++    {
++        err = readLPC(REG_CONTROL, ctrl);
++        if (err)
++        {
++            break;
++        }
++
++        // Tell the interface we're busy.
++        err = writeLPC(REG_CONTROL, CTRL_H_BUSY);
++        if (err)
++        {
++            break;
++        }
++
++        marked_busy = true;
++
++        // Clear the pending state from the control register.
++        // Note the spec distinctly says "after setting H_BUSY,
++        // the host should clear this bit" - not at the same time.
++        // This is the hand-shake; H_BUSY gates the BMC which allows
++        // us to clear the ATN bits. Don't get fancy.
++        err = writeLPC(REG_CONTROL, CTRL_B2H_ATN);
++        if (err)
++        {
++            break;
++        }
++
++        // Tell the interface we're reading
++        err = writeLPC(REG_CONTROL, CTRL_CLR_RD_PTR);
++        if (err)
++        {
++            break;
++        }
++
++        // The first byte is the length, grab it so we can allocate a buffer.
++        err = readLPC(REG_HOSTBMC, byte);
++        if (err)
++        {
++            break;
++        }
++
++        l_len = byte;
++        l_len -= 4;
++        if(l_len > MAX_PACKET_DATA_SIZE)
++        {
++            IPMI_TRAC(ERR_MRK "IpmiDD::receive() Data larger than expected,"
++                      " tuncating! size = %d",
++                      l_len);
++
++            l_len = MAX_PACKET_DATA_SIZE;
++        }
++
++        iv_data_len = static_cast<uint8_t>(l_len);
++
++        err = readLPC(REG_HOSTBMC, iv_netfun);
++        if (err)
++        {
++            break;
++        }
++
++        err = readLPC(REG_HOSTBMC, iv_seq);
++        if (err)
++        {
++            break;
++        }
++
++        err = readLPC(REG_HOSTBMC, iv_cmd);
++        if (err)
++        {
++            break;
++        }
++
++        err = readLPC(REG_HOSTBMC, iv_cc);
++        if (err)
++        {
++            break;
++        }
++
++        for( int i = 0; (i < l_len) && (err == 0); ++i)
++        {
++            err = readLPC(REG_HOSTBMC, iv_data[i]);
++            if(err)
++            {
++                break;
++            }
++        }
++        if (err)
++        {
++            break;
++        }
++
++    } while(0);
++
++    if (marked_busy)
++    {
++        // Clear the busy state (write 1 to toggle). Note if we get
++        // an error from the writeLPC, we toss it and return the first
++        // error as it likely has better information in it.
++        writeLPC(REG_CONTROL, CTRL_H_BUSY);
++    }
++
++
++    IPMI_TRAC("I> read b2h %x:%x seq %x cc %x",
++              iv_netfun,
++              iv_cmd,
++              iv_seq,
++              iv_cc);
++
++    return err;
++}
++
++/**
++ * @brief  Constructor
++ */
++IpmiDD::IpmiDD(uint8_t i_netfun,
++               uint8_t i_cmd,
++               uint8_t i_seq,
++               uint8_t i_cc,
++               uint8_t * i_data,
++               uint8_t i_data_len)
++    :
++        iv_netfun(i_netfun),
++        iv_seq(i_seq),
++        iv_cmd(i_cmd),
++        iv_cc(i_cc),
++        iv_data_len(i_data_len)
++{
++    if(iv_data_len > MAX_PACKET_DATA_SIZE)
++    {
++        iv_data_len = MAX_PACKET_DATA_SIZE;
++    }
++    for(int i = 0; i < iv_data_len; ++i)
++    {
++        iv_data[i] = i_data[i];
++    }
++}
+diff --git a/src/occ_gpe0/firdata/ipmidd.H b/src/occ_gpe0/firdata/ipmidd.H
+new file mode 100644
+index 000000000000..18eebbfa1380
+--- /dev/null
++++ b/src/occ_gpe0/firdata/ipmidd.H
+@@ -0,0 +1,207 @@
++/* IBM_PROLOG_BEGIN_TAG                                                   */
++/* This is an automatically generated prolog.                             */
++/*                                                                        */
++/* $Source: src/occ_405/firdata/ipmidd.H $                                */
++/*                                                                        */
++/* OpenPOWER OnChipController Project                                     */
++/*                                                                        */
++/* Contributors Listed Below - COPYRIGHT 2018                             */
++/* [+] International Business Machines Corp.                              */
++/*                                                                        */
++/*                                                                        */
++/* Licensed under the Apache License, Version 2.0 (the "License");        */
++/* you may not use this file except in compliance with the License.       */
++/* You may obtain a copy of the License at                                */
++/*                                                                        */
++/*     http://www.apache.org/licenses/LICENSE-2.0                         */
++/*                                                                        */
++/* Unless required by applicable law or agreed to in writing, software    */
++/* distributed under the License is distributed on an "AS IS" BASIS,      */
++/* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or        */
++/* implied. See the License for the specific language governing           */
++/* permissions and limitations under the License.                         */
++/*                                                                        */
++/* IBM_PROLOG_END_TAG                                                     */
++#ifndef __IPMI_IPMIDD_H
++#define __IPMI_IMPIDD_H
++
++#include <stdint.h>
++
++/** @file ipmidd.h
++ *  @brief Provides the interfaces to the IPMI Device Driver
++ */
++
++namespace IPMI
++{
++    enum network_function
++    {
++        NETFUN_IBM  = (0x3a << 2),
++        PNOR_CMD = 0x5a,
++    };
++
++    enum completion_code
++    {
++        CC_OK        = 0x00,
++        CC_CMDSPC1   = 0x80, // command specific completion code
++        CC_CMDSPC2   = 0x81, // command specific completion code
++        CC_BUSY      = 0xc0,
++        CC_INVALID   = 0xc1,
++        CC_CMDLUN    = 0xc2,
++        CC_TIMEOUT   = 0xc3,
++        CC_NOSPACE   = 0xc4,
++        CC_BADRESV   = 0xc5,
++        CC_TRUNC     = 0xc6,
++        CC_BADLEN    = 0xc7,
++        CC_TOOLONG   = 0xc8,
++        CC_OORANGE   = 0xc9,
++        CC_LONGREPLY = 0xca,
++        CC_BADSENSOR = 0xcb,
++        CC_REQINVAL  = 0xcc,
++        CC_CMDSENSOR = 0xcd,
++        CC_CANTREPLY = 0xce,
++        CC_DUPREQ    = 0xcf,
++        CC_SDRUPDATE = 0xd0,
++        CC_FMWUPDATE = 0xd1,
++        CC_BMCINIT   = 0xd2,
++        CC_BADDEST   = 0xd3,
++        CC_NOPERM    = 0xd4,
++        CC_BADSTATE  = 0xd5,
++        CC_ILLPARAM  = 0xd6,
++        CC_UNKBAD    = 0xff
++    };
++};
++
++enum {
++    // Registers. These are fixed for LPC/BT so we can hard-wire them
++    REG_CONTROL = 0xE4,
++    REG_HOSTBMC = 0xE5,
++    REG_INTMASK = 0xE6,
++
++    // Control register bits. The control register is interesting in that
++    // writing 0's never does anything; all registers are either set to 1
++    // when written with a 1 or toggled (1/0) when written with a one. So,
++    // we don't ever need to read-modify-write, we can just write an or'd
++    // mask of bits.
++    CTRL_B_BUSY        = (1 << 7),
++    CTRL_H_BUSY        = (1 << 6),
++    CTRL_OEM0          = (1 << 5),
++    CTRL_SMS_ATN       = (1 << 4),
++    CTRL_B2H_ATN       = (1 << 3),
++    CTRL_H2B_ATN       = (1 << 2),
++    CTRL_CLR_RD_PTR    = (1 << 1),
++    CTRL_CLR_WR_PTR    = (1 << 0),
++
++    IDLE_STATE = (CTRL_B_BUSY | CTRL_B2H_ATN |
++                  CTRL_SMS_ATN | CTRL_H2B_ATN),
++
++    // Bit in the INMASK register which signals to the BMC
++    // to reset it's end of things.
++    INT_BMC_HWRST      = (1 << 7),
++
++    // How long to sychronously wait for the device to change state
++    // (in micro seconds)
++    WAIT_TIME_US = 100000,
++    MAX_PACKET_DATA_SIZE = 16,
++    RC_IPMIDD_IDLE = 10,
++    RC_IPMIDD_NOT_IDLE = 11,
++    RC_IPMIDD_TIMEOUT = 12,
++    RC_BAD_SEQUENCE = 13,
++    RC_IPMIDD_INVALID_RESP_SIZE = 14,
++    RC_IPMI_EVENT = 15,
++    RC_IPMI_BUSY = 16,
++};
++
++/**
++ *  @brief IPMI Device Driver Class
++ *     Provides read/write message capabilities.
++ */
++class IpmiDD
++{
++    public: // data
++
++        uint8_t iv_netfun;
++        uint8_t iv_seq;
++        uint8_t iv_cmd;
++        uint8_t iv_cc;
++        uint8_t iv_data[MAX_PACKET_DATA_SIZE];
++        uint8_t iv_data_len;
++
++  public: // intefaces
++    /**
++     * @brief Poll the control register
++     *
++     * @parm void
++     */
++    int pollCtrl(void);
++
++    /**
++     * @brief Performs an IPMI message read operation
++     *
++     * @param[out] o_msg - Destination buffer for data
++     *
++     * @return SUCCESS | error code
++     */
++
++    int receive(void);
++    /**
++     * @brief Performs an IPMI message write operation
++     *
++     * @param[in] i_msg - Location of data to be written
++     *
++     * @return SUCCESS | error code
++     */
++    int send(void);
++
++    /**
++     * @brief Performs a reset of the BT hardware
++     *
++     * @param void
++     *
++     * @return SUCCESS | error code
++     */
++    int  reset(void);
++
++    /**
++     * @brief Constructor
++     *
++     * @parm void
++     */
++    IpmiDD(uint8_t i_netfun,
++           uint8_t i_cmd,
++           uint8_t i_seq,
++           uint8_t i_cc,
++           uint8_t * i_data,
++           uint8_t i_data_len);
++
++  public:
++
++  private:
++
++    /**
++     * @brief Read an address from LPC space
++     *
++     * @parm i_addr  Absolute LPC Address
++     * @parm o_data  Buffer to read data into
++     *
++     * @return Error from operation
++     */
++    int readLPC(const uint32_t i_addr, uint8_t& o_data);
++
++    /**
++     * @brief Write an address from LPC space
++     *
++     * @parm i_addr  Absolute LPC Address
++     * @parm i_data  Data to write
++     *
++     * @return Error from operation
++     */
++    int writeLPC(const uint32_t i_addr, uint8_t i_data);
++
++  private: // Variables
++
++    // Disallow copying this class.
++    IpmiDD& operator=(const IpmiDD&);
++    IpmiDD(const IpmiDD&);
++};
++
++#endif
+diff --git a/src/occ_gpe0/firdata/mboxOverIpmi.C b/src/occ_gpe0/firdata/mboxOverIpmi.C
+new file mode 100644
+index 000000000000..c0ee24304610
+--- /dev/null
++++ b/src/occ_gpe0/firdata/mboxOverIpmi.C
+@@ -0,0 +1,186 @@
++/* IBM_PROLOG_BEGIN_TAG                                                   */
++/* This is an automatically generated prolog.                             */
++/*                                                                        */
++/* $Source: src/occ_405/firdata/mboxOverIpmi.C $                          */
++/*                                                                        */
++/* OpenPOWER OnChipController Project                                     */
++/*                                                                        */
++/* Contributors Listed Below - COPYRIGHT 2018                             */
++/* [+] International Business Machines Corp.                              */
++/*                                                                        */
++/*                                                                        */
++/* Licensed under the Apache License, Version 2.0 (the "License");        */
++/* you may not use this file except in compliance with the License.       */
++/* You may obtain a copy of the License at                                */
++/*                                                                        */
++/*     http://www.apache.org/licenses/LICENSE-2.0                         */
++/*                                                                        */
++/* Unless required by applicable law or agreed to in writing, software    */
++/* distributed under the License is distributed on an "AS IS" BASIS,      */
++/* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or        */
++/* implied. See the License for the specific language governing           */
++/* permissions and limitations under the License.                         */
++/*                                                                        */
++/* IBM_PROLOG_END_TAG                                                     */
++
++extern "C" {
++
++#include "native.h"
++#include "gpe_util.h"
++#include "ast_mboxdd.h"
++
++int ipmi_sendCommand(mboxMessage_t *io_msg, int i_arg_size);
++
++}
++
++#include "ipmidd.H"
++
++enum
++{
++    IPMI_MAX_TRIES = 10000,
++};
++
++
++/**
++ * Wrap the astMbox message in an IPMI message and send/recv over IPMI
++ * interface.
++ */
++int ipmi_sendCommand(mboxMessage_t *io_msg, int i_arg_size)
++{
++    int rc = 0;
++    int i = 0;
++    uint8_t * l_data = reinterpret_cast<uint8_t*>(io_msg);
++    int l_data_size = i_arg_size + 2; //#args + iv_cmd + iv_seq
++
++    IpmiDD l_ipmidd(IPMI::NETFUN_IBM,
++                    IPMI::PNOR_CMD,
++                    io_msg->iv_seq, // seems unique enough to use this
++                    IPMI::CC_UNKBAD,
++                    l_data,
++                    l_data_size // #args + iv_cmd + iv_seq
++                   );
++
++    do
++    {
++        for(i = 0; i < IPMI_MAX_TRIES; ++i)
++        {
++            rc = l_ipmidd.send();
++            if(rc != RC_IPMIDD_NOT_IDLE)
++            {
++                break;
++            }
++            busy_wait(100); // 100 us
++        }
++
++        // Note: OCC_GPE can't generate error logs.
++        // For whatever reason errors are not returned to the OCC_405 as it
++        // probably can't report them either in the current state.
++        // If the write to PNOR fails then the fir data is simply not captured
++        // and only the PK trace has the reason.
++        // It's not clear if the PK trace can be extracted w/o Cronus.
++        if(i == IPMI_MAX_TRIES)
++        {
++            PK_TRACE("ipmi_sendCommand: cmd 0x%x TIMEOUT waiting to send",
++                     io_msg->iv_cmd);
++            rc = RC_IPMIDD_TIMEOUT;
++        }
++
++        if( rc )
++        {
++            break;
++        }
++
++        // Wait for response.
++        for(i = 0; i < IPMI_MAX_TRIES; ++i)
++        {
++            busy_wait(100);  // 100 us
++            rc = l_ipmidd.pollCtrl();
++
++            // keep waiting if IDLE or BUSY and ignore IPMI events
++            if ((rc != RC_IPMIDD_IDLE) &&
++                (rc != RC_IPMI_EVENT) &&
++                (rc != RC_IPMI_BUSY))
++            {
++                break;
++            }
++        }
++
++        if(i == IPMI_MAX_TRIES)
++        {
++            PK_TRACE("ipmi_sendCommand: cmd 0x%x TIMEOUT "
++                     "waiting for a response!",
++                     io_msg->iv_cmd);
++
++            rc = RC_IPMIDD_TIMEOUT;
++            break;
++        }
++
++        if( rc )
++        {
++            PK_TRACE("ipmi_sendCommand: cmd 0x%x Failed rc = %d",
++                     io_msg->iv_cmd,
++                     rc);
++            break;
++        }
++
++        // Return reponse code if not CC_OK;
++        if(l_ipmidd.iv_cc != IPMI::CC_OK)
++        {
++            PK_TRACE("ipmi_sendCommand: cmd 0x%x. IPMI completion code = 0x%x",
++                     io_msg->iv_cmd,
++                     l_ipmidd.iv_cc);
++
++            rc = (int)l_ipmidd.iv_cc;
++            break;
++        }
++
++        l_data_size = l_ipmidd.iv_data_len;
++
++        if(l_data_size > (int)sizeof(mboxMessage_t))
++        {
++            PK_TRACE("ipmi_sendCommand: recvd data packet too big (%d)",
++                     l_data_size);
++            rc = RC_IPMIDD_INVALID_RESP_SIZE;
++            break;
++        }
++
++
++        if( io_msg->iv_seq != l_ipmidd.iv_seq )
++        {
++            PK_TRACE("ipmi_sendCommand: cmd 0x%x bad sequence number "
++                     "in mboxMessage.  sent %d recvd %d",
++                     io_msg->iv_cmd,
++                     io_msg->iv_seq,
++                     l_ipmidd.iv_seq);
++
++            rc = RC_BAD_SEQUENCE;
++            break;
++        }
++
++        uint8_t org_cmd = io_msg->iv_cmd;
++
++        // This overwrites io_msg object with recvd ipmi msg payload
++        for(int i = 0; i < l_data_size; ++i)
++        {
++            l_data[i] = l_ipmidd.iv_data[i];
++        }
++
++        // The GET_INFO command does not have the same response format over
++        // IPMI as it does over ast-mbox. This work-around fixes that.
++        if(org_cmd == MBOX_C_GET_MBOX_INFO)
++        {
++           // Version 1 is the same between ast and IPMI
++           if(get8(io_msg,0) > 1)
++            {
++                io_msg->iv_args[5] = io_msg->iv_args[1];
++                io_msg->iv_args[6] = io_msg->iv_args[2];
++                io_msg->iv_args[7] = io_msg->iv_args[3];
++                io_msg->iv_args[8] = io_msg->iv_args[4];
++            }
++        }
++
++    } while(0);
++
++    return rc;
++}
++
+diff --git a/src/occ_gpe0/firdata/native.c b/src/occ_gpe0/firdata/native.c
+index 337c97b35fb2..4ffd52e97d40 100644
+--- a/src/occ_gpe0/firdata/native.c
++++ b/src/occ_gpe0/firdata/native.c
+@@ -26,10 +26,12 @@
+ #include <native.h>
+ #include <scom_trgt.h>
+ #include <scom_util.h>
++#include "gpe_util.h"
+ 
+-void sleep( PkInterval i_nanoseconds )
++void sleep( uint32_t i_microseconds )
+ {
+-    pk_sleep(PK_NANOSECONDS(i_nanoseconds));
++    // pk_sleep not available because GPE0 is running PK in threadless mode
++    busy_wait(i_microseconds);
+ }
+ 
+ int TRACE_XSCOM=0;
+diff --git a/src/occ_gpe0/firdata/native.h b/src/occ_gpe0/firdata/native.h
+index 195905d4474d..d90729dde87f 100644
+--- a/src/occ_gpe0/firdata/native.h
++++ b/src/occ_gpe0/firdata/native.h
+@@ -35,6 +35,7 @@ extern "C" {
+ #include "pk.h"
+ #ifdef __cplusplus
+ }
++typedef uint32_t trace_hash_val; // bug in trace function for c++
+ #endif
+ 
+ #ifdef FIRD_DEBUG
+@@ -87,7 +88,7 @@ int32_t xscom_read( uint32_t i_address, uint64_t * o_data );
+ int32_t xscom_write( uint32_t i_address, uint64_t i_data );
+ 
+ /* Sleep */
+-void sleep( PkInterval i_nanoseconds );
++void sleep( uint32_t i_microseconds );
+ 
+ 
+ #endif
+diff --git a/src/occ_gpe0/firdata/pnor_mboxdd.c b/src/occ_gpe0/firdata/pnor_mboxdd.c
+index 9c5a4e6dea63..4251eda90ccd 100644
+--- a/src/occ_gpe0/firdata/pnor_mboxdd.c
++++ b/src/occ_gpe0/firdata/pnor_mboxdd.c
+@@ -42,6 +42,7 @@ errorHndl_t hwInit(pnorMbox_t* i_pnorMbox)
+     errorHndl_t l_err = NO_ERROR;
+     uint8_t* l_data;
+     int i;
++    int l_arg_size = 0;
+     do
+     {
+         //Current window starts closed
+@@ -65,7 +66,8 @@ errorHndl_t hwInit(pnorMbox_t* i_pnorMbox)
+ 
+         l_getInfoMsg.iv_cmd = MBOX_C_GET_MBOX_INFO;
+         put8(&l_getInfoMsg, 0, 2);
+-        l_err = doMessage(&i_pnorMbox->iv_mbox, &l_getInfoMsg);
++        l_arg_size = 1;
++        l_err = doMessage(&i_pnorMbox->iv_mbox, &l_getInfoMsg, l_arg_size);
+         if (l_err)
+         {
+             TRAC_ERR("doMessage to ping BMC failed with rc=0x%x", l_err);
+@@ -89,7 +91,8 @@ errorHndl_t hwInit(pnorMbox_t* i_pnorMbox)
+         //Now get the size of the flash
+         mboxMessage_t l_getSizeMsg;
+         l_getSizeMsg.iv_cmd = MBOX_C_GET_FLASH_INFO;
+-        l_err = doMessage(&i_pnorMbox->iv_mbox, &l_getSizeMsg);
++        l_arg_size = 0;
++        l_err = doMessage(&i_pnorMbox->iv_mbox, &l_getSizeMsg, l_arg_size);
+         if (l_err)
+         {
+             TRAC_ERR("doMessage failed to get flash size rc=0x%x", l_err);
+@@ -220,9 +223,9 @@ errorHndl_t writeFlash(pnorMbox_t* i_pnorMbox,
+                 break;
+             }
+ 
+-            //For whatever reason LPC writes can only handle 4 bytes at a time
+-            //We write 256 bytes from the previous functions, so break up the
+-            //large write into 4 byte writes
++            //LPC writes are done via LPC scom interface and can only handle 4 
++            //bytes at a time. We write 256 bytes from the previous functions,
++            // so break up the large write into 4 byte writes
+             uint32_t l_size_written = 0;
+             uint32_t l_lpc_write_size = 4; //in bytes
+             uint8_t *l_lpc_write_data = i_data;
+@@ -263,9 +266,6 @@ errorHndl_t writeFlash(pnorMbox_t* i_pnorMbox,
+         }
+ 
+         /* We flush whether we had an error or not.
+-         *
+-         * NOTE: It would help the daemon a lot if we moved that out of here
+-         * and instead had a single flush call over a series of writes.
+          */
+         l_flushErr = writeFlush(i_pnorMbox);
+ 
+@@ -292,6 +292,7 @@ errorHndl_t adjustMboxWindow(pnorMbox_t* i_pnorMbox,
+ {
+     errorHndl_t l_err = NO_ERROR;
+     uint32_t l_pos, l_wSize, l_reqSize;
++    int l_arg_size = 0;
+ 
+     do
+     {
+@@ -361,7 +362,8 @@ errorHndl_t adjustMboxWindow(pnorMbox_t* i_pnorMbox,
+ 
+         put16(&winMsg, 0, l_pos >> i_pnorMbox->iv_blockShift);
+         put16(&winMsg, 2, l_reqSize >> i_pnorMbox->iv_blockShift);
+-        l_err = doMessage(&i_pnorMbox->iv_mbox, &winMsg);
++        l_arg_size = 4;
++        l_err = doMessage(&i_pnorMbox->iv_mbox, &winMsg, l_arg_size);
+ 
+         if (l_err)
+         {
+@@ -406,6 +408,7 @@ errorHndl_t writeDirty(pnorMbox_t* i_pnorMbox, uint32_t i_addr, uint32_t i_size)
+     uint32_t l_blockMask = (1u << i_pnorMbox->iv_blockShift) - 1;
+     uint32_t l_start     = i_addr & ~l_blockMask;
+     uint32_t l_end       = ((i_addr + i_size) + l_blockMask) & ~l_blockMask;
++    int l_arg_size = 0;
+ 
+     mboxMessage_t dirtyMsg;
+     dirtyMsg.iv_cmd = MBOX_C_MARK_WRITE_DIRTY;
+@@ -422,16 +425,18 @@ errorHndl_t writeDirty(pnorMbox_t* i_pnorMbox, uint32_t i_addr, uint32_t i_size)
+         put16(&dirtyMsg, 2, (l_end - l_start) >> i_pnorMbox->iv_blockShift);
+     }
+ 
+-    return doMessage(&i_pnorMbox->iv_mbox, &dirtyMsg);
++    l_arg_size = 4;
++    return doMessage(&i_pnorMbox->iv_mbox, &dirtyMsg, l_arg_size);
+ }
+ 
+ errorHndl_t writeFlush(pnorMbox_t* i_pnorMbox)
+ {
+     mboxMessage_t flushMsg;
+     flushMsg.iv_cmd = MBOX_C_WRITE_FLUSH;
++    int l_arg_size = 0;
+ 
+     put16(&flushMsg, 0, 0);
+     put32(&flushMsg, 2, 0);
+ 
+-    return doMessage(&i_pnorMbox->iv_mbox, &flushMsg);
++    return doMessage(&i_pnorMbox->iv_mbox, &flushMsg, l_arg_size);
+ }
+diff --git a/src/occ_gpe0/img_defs.mk b/src/occ_gpe0/img_defs.mk
+index 13f9ca98a5d8..15ff9ac164a9 100644
+--- a/src/occ_gpe0/img_defs.mk
++++ b/src/occ_gpe0/img_defs.mk
+@@ -94,6 +94,10 @@ ifndef PK_SRCDIR
+ export PK_SRCDIR = $(abspath ../ppe/pk)
+ endif
+ 
++ifndef PPE_STDINCDIR
++export PPE_STDINCDIR = $(abspath ../ppe/std)
++endif
++
+ ifndef COMMONLIB_SRCDIR
+ export COMMONLIB_SRCDIR = $(abspath ../lib/common)
+ endif
+@@ -148,7 +152,7 @@ OBJCOPY = $(GCC-TOOL-PREFIX)objcopy
+ TCPP    = $(PPETOOLS_OBJDIR)/ppetracepp $(GCC-TOOL-PREFIX)gcc
+ THASH	= $(PPETRACEPP_DIR)/tracehash.pl
+ CPP     = $(GCC-TOOL-PREFIX)gcc
+-TCXX    = $(PPETRACEPP_DIR)/ppetracepp $(GCC-TOOL-PREFIX)g++
++TCXX    = $(PPETOOLS_OBJDIR)/ppetracepp $(GCC-TOOL-PREFIX)g++
+ CXX     = $(GCC-TOOL-PREFIX)g++
+ 
+ ifeq "$(PK_TIMER_SUPPORT)" ""
+@@ -189,7 +193,7 @@ INCLUDES += $(IMG_INCLUDES) $(GLOBAL_INCLUDES) \
+ 	-I$(PK_SRCDIR)/kernel -I$(PK_SRCDIR)/ppe42 -I$(PK_SRCDIR)/trace \
+ 	-I$(PK_SRCDIR)/$(PPE_TYPE) -I$(PK_SRCDIR)/../../include \
+ 	-I$(PK_SRCDIR)/../../include/registers -I$(OCCLIB_SRCDIR) -I$(COMMONLIB_SRCDIR) \
+-    -I$(OCC_COMMON_TYPES_DIR) -I$(IMAGE_SRCDIR)/../common
++    -I$(OCC_COMMON_TYPES_DIR) -I$(IMAGE_SRCDIR)/../common -I$(PPE_STDINCDIR)
+ 
+ PIPE-CFLAGS = -pipe
+ 
+@@ -201,14 +205,15 @@ GCC-CFLAGS += -fdata-sections
+ GCC-CFLAGS += -msoft-float
+ GCC-CFLAGS += -mcpu=ppe42
+ GCC-CFLAGS += -meabi
++GCC-CFLAGS += -msdata=eabi
+ GCC-CFLAGS += -ffreestanding
+ GCC-CFLAGS += -fno-common
+ GCC-CFLAGS += -fno-inline-functions-called-once
+-GCC-CFLAGS += -std=gnu89
+ 
+-CFLAGS      =  -c $(GCC-CFLAGS) $(PIPE-CFLAGS) $(GCC-O-LEVEL) $(INCLUDES)
++CFLAGS      =  -c -std=gnu89 $(GCC-CFLAGS) $(PIPE-CFLAGS) $(GCC-O-LEVEL) $(INCLUDES)
+ 
+-CXXFLAGS    = -nostdinc++ -fno-rtti -fno-exceptions $(CFLAGS)
++CXXFLAGS    = -c -std=c++11 -nostdinc++ -fno-rtti -fno-exceptions \
++                   $(GCC-CFLAGS) $(PIPE-CFLAGS) $(GCC-O-LEVEL) $(INCLUDES)
+ 
+ CPPFLAGS    = -E
+ 
+@@ -224,6 +229,12 @@ PCP-FLAG = -e
+ $(OBJDIR)/%.s: %.c
+ 	$(TCC) $(CFLAGS) $(DEFS) -S -o $@ $<
+ 
++%.o: %.C
++
++$(OBJDIR)/%.s: %.C
++	$(TCXX) $(CXXFLAGS) $(DEFS) -S -o $@ $<
++
++
+ #override the GNU Make implicit rule for going from a .S to a .o
+ %.o: %.S
+ 
+@@ -244,6 +255,13 @@ $(OBJDIR)/%.d: %.c
+ 	sed 's,\($*\)\.d[ :]*,\1.es $@ : ,g' < $@.$$$$ > $@; \
+ 	rm -f $@.$$$$
+ 
++$(OBJDIR)/%.d: %.C
++	@set -e; rm -f $@; \
++	echo -n "$(OBJDIR)/" > $@.$$$$; \
++	$(CXX) -MM $(INCLUDES) $(CPPFLAGS) $(DEFS) $< >> $@.$$$$; \
++	sed 's,\($*\)\.o[ :]*,\1.o $@ : ,g' < $@.$$$$ > $@; \
++	rm -f $@.$$$$
++
+ $(OBJDIR)/%.d: %.S
+ 	@set -e; rm -f $@; \
+ 	if [ "$(dir $*)" != "./" ]; then \
+diff --git a/src/occ_gpe0/topfiles.mk b/src/occ_gpe0/topfiles.mk
+index 332a2c3ebe60..456f69a81c09 100644
+--- a/src/occ_gpe0/topfiles.mk
++++ b/src/occ_gpe0/topfiles.mk
+@@ -23,9 +23,12 @@
+ #
+ # IBM_PROLOG_END_TAG
+ FIRDATA_SOURCES = $(wildcard firdata/*.c)
++FIRDATA_CXX_SOURCES = $(wildcard firdata/*.C)
++
+ TOP-C-SOURCES = gpe0_main.c pk_app_irq_table.c ipc_func_tables.c apss_read.c \
+                 apss_init.c gpe_util.c core_data.c gpe_core_data.c nest_dts.c ${FIRDATA_SOURCES} \
+                 gpe_get_tod.c
++TOP-CXX-SOURCES = ${FIRDATA_CXX_SOURCES}
+ TOP-S-SOURCES =
+ 
+-TOP_OBJECTS = $(TOP-C-SOURCES:.c=.o) $(TOP-S-SOURCES:.S=.o)
++TOP_OBJECTS = $(TOP-C-SOURCES:.c=.o) $(TOP-CXX-SOURCES:.C=.o) $(TOP-S-SOURCES:.S=.o)
+-- 
+2.17.1
+
