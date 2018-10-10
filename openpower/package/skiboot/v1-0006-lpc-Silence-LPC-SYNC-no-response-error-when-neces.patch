@@ -1,0 +1,194 @@
+From 1d8793c64b596cfdcc3cf6035a3b4cbe3c341ae9 Mon Sep 17 00:00:00 2001
+From: Andrew Jeffery <andrew@aj.id.au>
+Date: Tue, 17 Jul 2018 11:32:54 +0930
+Subject: [PATCH v1 6/6] lpc: Silence LPC SYNC no-response error when necessary
+
+Add the ability to silence particular errors from the LPC bus when they
+can be expected, particularly:
+
+	LPC[000]: Got SYNC no-response error. Error address reg: 0xd001002f
+
+This is necessary on platform exit on some astbmc machines to avoid
+unnecessary noise in the msglog.
+
+Signed-off-by: Andrew Jeffery <andrew@aj.id.au>
+Signed-off-by: Stewart Smith <stewart@linux.ibm.com>
+---
+ hw/ast-bmc/ast-io.c       | 45 +++++++++++++++++++++++++++++++++++++++
+ hw/lpc.c                  | 23 +++++++++++++++++++-
+ include/ast.h             |  1 +
+ include/lpc.h             |  3 +++
+ platforms/astbmc/common.c | 28 +-----------------------
+ 5 files changed, 72 insertions(+), 28 deletions(-)
+
+diff --git a/hw/ast-bmc/ast-io.c b/hw/ast-bmc/ast-io.c
+index eb80181e481a..4277e2d10ec3 100644
+--- a/hw/ast-bmc/ast-io.c
++++ b/hw/ast-bmc/ast-io.c
+@@ -360,6 +360,51 @@ bool ast_sio_init(void)
+ 	return enabled;
+ }
+ 
++bool ast_sio_disable(void)
++{
++	uint32_t hw_strapping;
++	uint32_t silicon_rev;
++	uint8_t family;
++
++	/* Determine the necessary strapping value */
++	silicon_rev = ast_ahb_readl(SCU_REVISION_ID);
++	family = SCU_REVISION_SOC_FAMILY(silicon_rev);
++
++	if (family == SCU_REVISION_SOC_FAMILY_2400) {
++		/* Strapping is read-modify-write on SCU70 */
++		hw_strapping = SCU_STRAP_SIO_DECODE_DISABLE;
++		hw_strapping |= ast_ahb_readl(SCU_HW_STRAPPING);
++	} else if (family == SCU_REVISION_SOC_FAMILY_2500) {
++		/*
++		 * Strapping is W1S on SCU70, W1C on SCU7C. We're setting a bit
++		 * so read-modify-write *should* work, but in reality it breaks
++		 * the AXI/AHB divider, so don't do that.
++		 */
++		hw_strapping = SCU_STRAP_SIO_DECODE_DISABLE;
++	} else {
++		prerror("PLAT: Unrecognised BMC silicon revision 0x%x\n",
++			silicon_rev);
++		return false;
++	}
++
++	/* Apply the strapping value */
++	bmc_sio_get(BMC_SIO_DEV_LPC2AHB);
++
++	bmc_sio_ahb_prep(SCU_HW_STRAPPING, 2);
++
++	bmc_sio_outb(hw_strapping >> 24, 0xf4);
++	bmc_sio_outb(hw_strapping >> 16, 0xf5);
++	bmc_sio_outb(hw_strapping >>  8, 0xf6);
++	bmc_sio_outb(hw_strapping      , 0xf7);
++
++	lpc_irq_err_mask_sync_no_response();
++	bmc_sio_outb(0xcf, 0xfe);
++
++	bmc_sio_put(true);
++
++	return true;
++}
++
+ bool ast_can_isolate_sp(void)
+ {
+ 	return bmc_sio_inb(BMC_SIO_PLAT_FLAGS) & BMC_SIO_PLAT_ISOLATE_SP;
+diff --git a/hw/lpc.c b/hw/lpc.c
+index fbc49c556f04..0eccad820168 100644
+--- a/hw/lpc.c
++++ b/hw/lpc.c
+@@ -891,6 +891,20 @@ static void lpc_dispatch_reset(struct lpcm *lpc)
+ 		lpc_setup_serirq(lpc);
+ }
+ 
++uint32_t lpc_irq_err_mask;
++
++void lpc_irq_err_mask_sync_no_response(void)
++{
++	lpc_irq_err_mask |= LPC_HC_IRQ_SYNC_NORESP_ERR;
++	lwsync();
++}
++
++static void lpc_irq_err_mask_reset(void)
++{
++	lpc_irq_err_mask = 0;
++	lwsync();
++}
++
+ static void lpc_dispatch_err_irqs(struct lpcm *lpc, uint32_t irqs)
+ {
+ 	const char *sync_err = "Unknown LPC error";
+@@ -911,8 +925,12 @@ static void lpc_dispatch_err_irqs(struct lpcm *lpc, uint32_t irqs)
+ 		lpc_dispatch_reset(lpc);
+ 	if (irqs & LPC_HC_IRQ_SYNC_ABNORM_ERR)
+ 		sync_err = "Got SYNC abnormal error.";
+-	if (irqs & LPC_HC_IRQ_SYNC_NORESP_ERR)
++	if (irqs & LPC_HC_IRQ_SYNC_NORESP_ERR) {
++		if (lpc_irq_err_mask & LPC_HC_IRQ_SYNC_NORESP_ERR)
++			goto done;
++
+ 		sync_err = "Got SYNC no-response error.";
++	}
+ 	if (irqs & LPC_HC_IRQ_SYNC_NORM_ERR)
+ 		sync_err = "Got SYNC normal error.";
+ 	if (irqs & LPC_HC_IRQ_SYNC_TIMEOUT_ERR)
+@@ -940,6 +958,9 @@ static void lpc_dispatch_err_irqs(struct lpcm *lpc, uint32_t irqs)
+ 		log_simple_error(info, "LPC[%03x]: %s Error address reg: "
+ 				 "0x%08x\n",
+ 				 lpc->chip_id, sync_err, err_addr);
++
++done:
++	lpc_irq_err_mask_reset();
+ }
+ 
+ static void lpc_dispatch_ser_irqs(struct lpcm *lpc, uint32_t irqs,
+diff --git a/include/ast.h b/include/ast.h
+index 1b5e0013542b..b30f7bf27737 100644
+--- a/include/ast.h
++++ b/include/ast.h
+@@ -83,6 +83,7 @@ uint32_t ast_ahb_readl(uint32_t reg);
+ 
+ bool ast_sio_init(void);
+ bool ast_can_isolate_sp(void);
++bool ast_sio_disable(void);
+ bool ast_io_init(void);
+ bool ast_io_is_rw(void);
+ bool ast_lpc_fw_is_flash(void);
+diff --git a/include/lpc.h b/include/lpc.h
+index 2347011d3657..bd6200e2e77c 100644
+--- a/include/lpc.h
++++ b/include/lpc.h
+@@ -168,4 +168,7 @@ static inline uint32_t lpc_inl(uint32_t addr)
+ 	return (rc == OPAL_SUCCESS) ? le32_to_cpu(d32) : 0xffffffff;
+ }
+ 
++/* LPC IRQ error masking - required for some corner cases */
++extern void lpc_irq_err_mask_sync_no_response(void);
++
+ #endif /* __LPC_H */
+diff --git a/platforms/astbmc/common.c b/platforms/astbmc/common.c
+index 4b5d9a68579b..2c32db7295af 100644
+--- a/platforms/astbmc/common.c
++++ b/platforms/astbmc/common.c
+@@ -430,33 +430,7 @@ void astbmc_early_init(void)
+ 
+ static bool astbmc_isolate_via_io(void)
+ {
+-	uint32_t hw_strapping;
+-	uint32_t silicon_rev;
+-	uint8_t family;
+-
+-	silicon_rev = ast_ahb_readl(SCU_REVISION_ID);
+-	family = SCU_REVISION_SOC_FAMILY(silicon_rev);
+-
+-	if (family == SCU_REVISION_SOC_FAMILY_2400) {
+-		/* Strapping is read-modify-write on SCU70 */
+-		hw_strapping = SCU_STRAP_SIO_DECODE_DISABLE;
+-		hw_strapping |= ast_ahb_readl(SCU_HW_STRAPPING);
+-	} else if (family == SCU_REVISION_SOC_FAMILY_2500) {
+-		/*
+-		 * Strapping is W1S on SCU70, W1C on SCU7C. We're setting a bit
+-		 * so read-modify-write *should* work, but in reality it breaks
+-		 * the AXI/AHB divider, so don't do that.
+-		 */
+-		hw_strapping = SCU_STRAP_SIO_DECODE_DISABLE;
+-	} else {
+-		prerror("PLAT: Unrecognised BMC silicon revision 0x%x, isolation failed\n",
+-			silicon_rev);
+-		return false;
+-	}
+-
+-	ast_ahb_writel(hw_strapping, SCU_HW_STRAPPING);
+-
+-	return true;
++	return ast_sio_disable();
+ }
+ 
+ static bool astbmc_isolate_via_ipmi(void)
+-- 
+2.17.1
+

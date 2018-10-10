@@ -1,0 +1,57 @@
+From 451b66d9925b1ef2841e867ce693f126efe5a9db Mon Sep 17 00:00:00 2001
+From: Andrew Jeffery <andrew@aj.id.au>
+Date: Mon, 27 Aug 2018 13:55:03 +0930
+Subject: [PATCH v3 03/11] core/flash: Only lock around flashes update in
+ flash_register()
+
+Previously in flash_register() held flash_lock across ffs_init(), which
+calls through the blocklevel layer to read the flash. This is unhelpful
+with the IPMI HIOMAP protocol transport as LPC interrupts have not yet
+been enabled and we are relying on polling to progress. The held lock
+stalls the boot as we take the nopoll path in time_wait() while
+completing ipmi_queue_msg_sync() in libflash/ipmi-flash.c
+
+Signed-off-by: Andrew Jeffery <andrew@aj.id.au>
+---
+ core/flash.c | 8 ++------
+ 1 file changed, 2 insertions(+), 6 deletions(-)
+
+diff --git a/core/flash.c b/core/flash.c
+index 8e7b90e672c4..15eb7443faac 100644
+--- a/core/flash.c
++++ b/core/flash.c
+@@ -406,13 +406,9 @@ int flash_register(struct blocklevel_device *bl)
+ 	prlog(PR_INFO, "FLASH: registering flash device %s "
+ 			"(size 0x%llx, blocksize 0x%x)\n",
+ 			name ?: "(unnamed)", size, block_size);
+-
+-	lock(&flash_lock);
+-
+ 	flash = malloc(sizeof(struct flash));
+ 	if (!flash) {
+ 		prlog(PR_ERR, "FLASH: Error allocating flash structure\n");
+-		unlock(&flash_lock);
+ 		return OPAL_RESOURCE;
+ 	}
+ 
+@@ -423,8 +419,6 @@ int flash_register(struct blocklevel_device *bl)
+ 	flash->block_size = block_size;
+ 	flash->id = num_flashes();
+ 
+-	list_add(&flashes, &flash->list);
+-
+ 	rc = ffs_init(0, flash->size, bl, &ffs, 1);
+ 	if (rc) {
+ 		/**
+@@ -445,6 +439,8 @@ int flash_register(struct blocklevel_device *bl)
+ 	if (ffs)
+ 		ffs_close(ffs);
+ 
++	lock(&flash_lock);
++	list_add(&flashes, &flash->list);
+ 	unlock(&flash_lock);
+ 
+ 	return OPAL_SUCCESS;
+-- 
+2.17.1
+

@@ -1,0 +1,31 @@
+From 809bc6cb76bbb8e9a97262b75af6ae0d7f816541 Mon Sep 17 00:00:00 2001
+From: Andrew Jeffery <andrew@aj.id.au>
+Date: Tue, 25 Sep 2018 09:30:58 +0930
+Subject: [PATCH v3 11/11] astbmc: Fail SFC init if SIO is unavailable
+
+If SuperIO is unavailable then the driver cannot perform accesses on
+which it currently depends. Test for SuperIO availability during
+initialsation and bail out immediately if it is absent.
+
+Signed-off-by: Andrew Jeffery <andrew@aj.id.au>
+---
+ hw/ast-bmc/ast-sf-ctrl.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/hw/ast-bmc/ast-sf-ctrl.c b/hw/ast-bmc/ast-sf-ctrl.c
+index 32fc63ae33d6..11eb30f5619e 100644
+--- a/hw/ast-bmc/ast-sf-ctrl.c
++++ b/hw/ast-bmc/ast-sf-ctrl.c
+@@ -948,6 +948,9 @@ int ast_sf_open(uint8_t type, struct spi_flash_ctrl **ctrl)
+ 	struct ast_sf_ctrl *ct;
+ #ifdef __SKIBOOT__
+ 	uint32_t hicr7;
++
++	if (!ast_sio_is_enabled())
++		return -ENODEV;
+ #endif /* __SKIBOOT__ */
+ 
+ 	if (type != AST_SF_TYPE_PNOR && type != AST_SF_TYPE_BMC
+-- 
+2.17.1
+

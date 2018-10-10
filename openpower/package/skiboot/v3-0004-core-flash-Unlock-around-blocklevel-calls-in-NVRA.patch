@@ -1,0 +1,49 @@
+From 50eafc9102ce9dcf377cfb5243d1b81855021320 Mon Sep 17 00:00:00 2001
+From: Andrew Jeffery <andrew@aj.id.au>
+Date: Mon, 27 Aug 2018 21:37:54 +0930
+Subject: [PATCH v3 04/11] core/flash: Unlock around blocklevel calls in NVRAM
+ accessors
+
+This ensures progress when we don't have interrupts available for IPMI.
+
+Signed-off-by: Andrew Jeffery <andrew@aj.id.au>
+---
+ core/flash.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/core/flash.c b/core/flash.c
+index 15eb7443faac..83c1112636e6 100644
+--- a/core/flash.c
++++ b/core/flash.c
+@@ -118,8 +118,13 @@ static int flash_nvram_start_read(void *dst, uint32_t src, uint32_t len)
+ 		goto out;
+ 	}
+ 
++	nvram_flash->busy = true;
++	unlock(&flash_lock);
++
+ 	rc = blocklevel_read(nvram_flash->bl, nvram_offset + src, dst, len);
+ 
++	lock(&flash_lock);
++	nvram_flash->busy = false;
+ out:
+ 	unlock(&flash_lock);
+ 	if (!rc)
+@@ -147,8 +152,14 @@ static int flash_nvram_write(uint32_t dst, void *src, uint32_t len)
+ 		rc = OPAL_PARAMETER;
+ 		goto out;
+ 	}
++
++	nvram_flash->busy = true;
++	unlock(&flash_lock);
++
+ 	rc = blocklevel_write(nvram_flash->bl, nvram_offset + dst, src, len);
+ 
++	lock(&flash_lock);
++	nvram_flash->busy = false;
+ out:
+ 	unlock(&flash_lock);
+ 	return rc;
+-- 
+2.17.1
+

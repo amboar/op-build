@@ -1,0 +1,191 @@
+From a644947bb5362ffa15af3040a0f9bff83a7d482b Mon Sep 17 00:00:00 2001
+From: Andrew Jeffery <andrew@aj.id.au>
+Date: Mon, 13 Aug 2018 21:58:21 +0930
+Subject: [PATCH v3 06/11] astbmc: Prefer ipmi-hiomap for PNOR access
+
+If the IPMI command is not available, fall back to the mailbox
+interface.
+
+Signed-off-by: Andrew Jeffery <andrew@aj.id.au>
+---
+ hw/ast-bmc/ast-io.c       | 10 +++++++---
+ include/ast.h             |  4 ++--
+ libflash/mbox-flash.c     |  6 ++++++
+ platforms/astbmc/common.c | 10 ++++++----
+ platforms/astbmc/pnor.c   | 42 +++++++++++++++++++++++++++++----------
+ 5 files changed, 53 insertions(+), 19 deletions(-)
+
+diff --git a/hw/ast-bmc/ast-io.c b/hw/ast-bmc/ast-io.c
+index a6ae85a4d24f..e8258b4cfc02 100644
+--- a/hw/ast-bmc/ast-io.c
++++ b/hw/ast-bmc/ast-io.c
+@@ -426,12 +426,16 @@ bool ast_io_init(void)
+ 	return ast_io_is_rw();
+ }
+ 
+-bool ast_lpc_fw_is_mbox(void)
++bool ast_lpc_fw_needs_hiomap(void)
+ {
+-	return dt_find_compatible_node(dt_root, NULL, "mbox");
++	struct dt_node *n;
++
++	n = dt_find_compatible_node(dt_root, NULL, "mbox");
++
++	return n != NULL;
+ }
+ 
+-bool ast_lpc_fw_is_flash(void)
++bool ast_lpc_fw_maps_flash(void)
+ {
+ 	uint8_t boot_version;
+ 	uint8_t boot_flags;
+diff --git a/include/ast.h b/include/ast.h
+index b30f7bf27737..4c8fd817b253 100644
+--- a/include/ast.h
++++ b/include/ast.h
+@@ -86,8 +86,8 @@ bool ast_can_isolate_sp(void);
+ bool ast_sio_disable(void);
+ bool ast_io_init(void);
+ bool ast_io_is_rw(void);
+-bool ast_lpc_fw_is_flash(void);
+-bool ast_lpc_fw_is_mbox(void);
++bool ast_lpc_fw_maps_flash(void);
++bool ast_lpc_fw_needs_hiomap(void);
+ bool ast_scratch_reg_is_mbox(void);
+ 
+ /* UART configuration */
+diff --git a/libflash/mbox-flash.c b/libflash/mbox-flash.c
+index 3239be964b57..11ec90523d58 100644
+--- a/libflash/mbox-flash.c
++++ b/libflash/mbox-flash.c
+@@ -1134,6 +1134,12 @@ int mbox_flash_init(struct blocklevel_device **bl)
+ 	if (!bl)
+ 		return FLASH_ERR_PARM_ERROR;
+ 
++	/* XXX: We only support one blocklevel flash device over mbox. If we
++	 * ever support more than one, move this out. The chances of that are
++	 * slim though due to circumstances.
++	 */
++	mbox_init();
++
+ 	*bl = NULL;
+ 
+ 	mbox_flash = zalloc(sizeof(struct mbox_flash_data));
+diff --git a/platforms/astbmc/common.c b/platforms/astbmc/common.c
+index 23550ef37a67..f3b7e749f87c 100644
+--- a/platforms/astbmc/common.c
++++ b/platforms/astbmc/common.c
+@@ -120,11 +120,15 @@ static int astbmc_fru_init(void)
+ 
+ void astbmc_init(void)
+ {
++	/* Register the BT interface with the IPMI layer
++	 *
++	 * Initialise this first to enable PNOR access
++	 */
++	bt_init();
++
+ 	/* Initialize PNOR/NVRAM */
+ 	pnor_init();
+ 
+-	/* Register the BT interface with the IPMI layer */
+-	bt_init();
+ 	/* Initialize elog */
+ 	elog_init();
+ 	ipmi_sel_init();
+@@ -423,8 +427,6 @@ void astbmc_early_init(void)
+ 	/* Setup UART and use it as console */
+ 	uart_init();
+ 
+-	mbox_init();
+-
+ 	prd_init();
+ }
+ 
+diff --git a/platforms/astbmc/pnor.c b/platforms/astbmc/pnor.c
+index 55784ee4594f..d2694768e330 100644
+--- a/platforms/astbmc/pnor.c
++++ b/platforms/astbmc/pnor.c
+@@ -18,6 +18,7 @@
+ #include <device.h>
+ #include <console.h>
+ #include <opal.h>
++#include <libflash/ipmi-hiomap.h>
+ #include <libflash/mbox-flash.h>
+ #include <libflash/libflash.h>
+ #include <libflash/libffs.h>
+@@ -26,16 +27,27 @@
+ 
+ #include "astbmc.h"
+ 
++enum ast_flash_style {
++    raw_flash,
++    raw_mem,
++    ipmi_hiomap,
++    mbox_hiomap,
++};
++
+ int pnor_init(void)
+ {
+ 	struct spi_flash_ctrl *pnor_ctrl = NULL;
+ 	struct blocklevel_device *bl = NULL;
++	enum ast_flash_style style;
+ 	int rc;
+-	bool do_mbox;
+ 
+-	do_mbox = ast_lpc_fw_is_mbox();
+-	if (do_mbox) {
+-		rc = mbox_flash_init(&bl);
++	if (ast_lpc_fw_needs_hiomap()) {
++		style = ipmi_hiomap;
++		rc = ipmi_hiomap_init(&bl);
++		if (rc) {
++			style = mbox_hiomap;
++			rc = mbox_flash_init(&bl);
++		}
+ 	} else {
+ 		/* Open controller and flash. If the LPC->AHB doesn't point to
+ 		 * the PNOR flash base we assume we're booting from BMC system
+@@ -43,10 +55,12 @@ int pnor_init(void)
+ 		 * FW reads & writes).
+ 		 */
+ 
+-		if (ast_lpc_fw_is_flash())
++		if (ast_lpc_fw_maps_flash()) {
++			style = raw_flash;
+ 			rc = ast_sf_open(AST_SF_TYPE_PNOR, &pnor_ctrl);
+-		else {
++		} else {
+ 			printf("PLAT: Memboot detected\n");
++			style = raw_mem;
+ 			rc = ast_sf_open(AST_SF_TYPE_MEM, &pnor_ctrl);
+ 		}
+ 		if (rc) {
+@@ -66,12 +80,20 @@ int pnor_init(void)
+ 	if (!rc)
+ 		return 0;
+ 
+- fail:
++fail:
+ 	if (bl) {
+-		if (do_mbox)
+-			mbox_flash_exit(bl);
+-		else
++		switch (style) {
++		case raw_flash:
++		case raw_mem:
+ 			flash_exit(bl);
++			break;
++		case ipmi_hiomap:
++			ipmi_hiomap_exit(bl);
++			break;
++		case mbox_hiomap:
++			mbox_flash_exit(bl);
++			break;
++		}
+ 	}
+ 	if (pnor_ctrl)
+ 		ast_sf_close(pnor_ctrl);
+-- 
+2.17.1
+

@@ -1,0 +1,165 @@
+From f89ed724baa3a207f642ac8e4f7e46cd7044c30f Mon Sep 17 00:00:00 2001
+From: Andrew Jeffery <andrew@aj.id.au>
+Date: Sat, 22 Sep 2018 12:27:17 +0930
+Subject: [PATCH v3 07/11] astbmc: Remove coordinated isolation support
+
+Signed-off-by: Andrew Jeffery <andrew@aj.id.au>
+---
+ hw/ast-bmc/ast-io.c       | 56 ---------------------------------------
+ include/ast.h             |  2 --
+ platforms/astbmc/common.c | 47 +++++---------------------------
+ 3 files changed, 6 insertions(+), 99 deletions(-)
+
+diff --git a/hw/ast-bmc/ast-io.c b/hw/ast-bmc/ast-io.c
+index e8258b4cfc02..7f8c2dafa5ef 100644
+--- a/hw/ast-bmc/ast-io.c
++++ b/hw/ast-bmc/ast-io.c
+@@ -360,62 +360,6 @@ bool ast_sio_init(void)
+ 	return enabled;
+ }
+ 
+-bool ast_sio_disable(void)
+-{
+-	uint32_t hw_strapping;
+-	uint32_t silicon_rev;
+-	uint8_t family;
+-
+-	/* Determine the necessary strapping value */
+-	silicon_rev = ast_ahb_readl(SCU_REVISION_ID);
+-	family = SCU_REVISION_SOC_FAMILY(silicon_rev);
+-
+-	if (family == SCU_REVISION_SOC_FAMILY_2400) {
+-		/* Strapping is read-modify-write on SCU70 */
+-		hw_strapping = SCU_STRAP_SIO_DECODE_DISABLE;
+-		hw_strapping |= ast_ahb_readl(SCU_HW_STRAPPING);
+-	} else if (family == SCU_REVISION_SOC_FAMILY_2500) {
+-		/*
+-		 * Strapping is W1S on SCU70, W1C on SCU7C. We're setting a bit
+-		 * so read-modify-write *should* work, but in reality it breaks
+-		 * the AXI/AHB divider, so don't do that.
+-		 */
+-		hw_strapping = SCU_STRAP_SIO_DECODE_DISABLE;
+-	} else {
+-		prerror("PLAT: Unrecognised BMC silicon revision 0x%x\n",
+-			silicon_rev);
+-		return false;
+-	}
+-
+-	/* Apply the strapping value */
+-	bmc_sio_get(BMC_SIO_DEV_LPC2AHB);
+-
+-	bmc_sio_ahb_prep(SCU_HW_STRAPPING, 2);
+-
+-	bmc_sio_outb(hw_strapping >> 24, 0xf4);
+-	bmc_sio_outb(hw_strapping >> 16, 0xf5);
+-	bmc_sio_outb(hw_strapping >>  8, 0xf6);
+-	bmc_sio_outb(hw_strapping      , 0xf7);
+-
+-	lpc_irq_err_mask_sync_no_response();
+-	bmc_sio_outb(0xcf, 0xfe);
+-
+-	bmc_sio_put(true);
+-
+-	return true;
+-}
+-
+-bool ast_can_isolate_sp(void)
+-{
+-	bool isolate;
+-
+-	bmc_sio_get(BMC_SIO_DEV_LPC2AHB);
+-	isolate = bmc_sio_inb(BMC_SIO_PLAT_FLAGS) & BMC_SIO_PLAT_ISOLATE_SP;
+-	bmc_sio_put(true);
+-
+-	return isolate;
+-}
+-
+ bool ast_io_is_rw(void)
+ {
+ 	return !(ast_ahb_readl(LPC_HICRB) & LPC_HICRB_ILPC_DISABLE);
+diff --git a/include/ast.h b/include/ast.h
+index 4c8fd817b253..c3e171804dee 100644
+--- a/include/ast.h
++++ b/include/ast.h
+@@ -82,8 +82,6 @@ void ast_ahb_writel(uint32_t val, uint32_t reg);
+ uint32_t ast_ahb_readl(uint32_t reg);
+ 
+ bool ast_sio_init(void);
+-bool ast_can_isolate_sp(void);
+-bool ast_sio_disable(void);
+ bool ast_io_init(void);
+ bool ast_io_is_rw(void);
+ bool ast_lpc_fw_maps_flash(void);
+diff --git a/platforms/astbmc/common.c b/platforms/astbmc/common.c
+index f3b7e749f87c..0cf70e260d94 100644
+--- a/platforms/astbmc/common.c
++++ b/platforms/astbmc/common.c
+@@ -406,23 +406,15 @@ void astbmc_early_init(void)
+ 	psi_set_external_irq_policy(EXTERNAL_IRQ_POLICY_SKIBOOT);
+ 
+ 	if (ast_sio_init()) {
+-		if (!ast_can_isolate_sp()) {
+-			/*
+-			 * BMCs claiming support for isolation must have
+-			 * correctly configured the UART and BT for host
+-			 * firmware. If not, let's apply some fixups for broken
+-			 * BMC firmwares.
+-			 */
+-			if (ast_io_init()) {
+-				astbmc_fixup_uart();
+-				ast_setup_ibt(BT_IO_BASE, BT_LPC_IRQ);
+-			} else
+-				prerror("PLAT: AST IO initialisation failed!\n");
+-		}
++		if (ast_io_init()) {
++			astbmc_fixup_uart();
++			ast_setup_ibt(BT_IO_BASE, BT_LPC_IRQ);
++		} else
++			prerror("PLAT: AST IO initialisation failed!\n");
+ 
+ 		ast_setup_sio_mbox(MBOX_IO_BASE, MBOX_LPC_IRQ);
+ 	} else
+-		prerror("PLAT: AST SIO initialisation failed!\n");
++		prlog(PR_WARNING, "PLAT: AST SIO unavailable!\n");
+ 
+ 	/* Setup UART and use it as console */
+ 	uart_init();
+@@ -430,35 +422,8 @@ void astbmc_early_init(void)
+ 	prd_init();
+ }
+ 
+-static bool astbmc_isolate_via_io(void)
+-{
+-	return ast_sio_disable();
+-}
+-
+-static bool astbmc_isolate_via_ipmi(void)
+-{
+-	return false;
+-}
+-
+-static void astbmc_isolate(void)
+-{
+-	bool isolated;
+-
+-	isolated = ast_io_is_rw() ? astbmc_isolate_via_io()
+-				  : astbmc_isolate_via_ipmi();
+-
+-	if (!isolated) {
+-		prlog(PR_EMERG, "PLAT: BMC isolation failed\n");
+-		abort();
+-	}
+-
+-	prlog(PR_INFO, "PLAT: Isolated BMC\n");
+-}
+-
+ void astbmc_exit(void)
+ {
+-	if (ast_can_isolate_sp())
+-		astbmc_isolate();
+ 	ipmi_wdt_final_reset();
+ }
+ 
+-- 
+2.17.1
+

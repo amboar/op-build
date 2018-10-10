@@ -1,0 +1,41 @@
+From 7a5af6da49b9da76c90cc76f020175dbf6fcfe6e Mon Sep 17 00:00:00 2001
+From: Andrew Jeffery <andrew@aj.id.au>
+Date: Tue, 17 Jul 2018 11:32:51 +0930
+Subject: [PATCH v1 3/6] core/pci-quirk: Clean up commented code in
+ quirk_astbmc_vga()
+
+Also remove the comment associated with the commented code.
+
+Signed-off-by: Andrew Jeffery <andrew@aj.id.au>
+Signed-off-by: Stewart Smith <stewart@linux.ibm.com>
+---
+ core/pci-quirk.c | 13 -------------
+ 1 file changed, 13 deletions(-)
+
+diff --git a/core/pci-quirk.c b/core/pci-quirk.c
+index 983240734c16..7ed6b795d8c8 100644
+--- a/core/pci-quirk.c
++++ b/core/pci-quirk.c
+@@ -33,19 +33,6 @@ static void quirk_astbmc_vga(struct phb *phb __unused,
+ 	dt_add_property_cells(np, "aspeed,mcr-configuration", mcr_configuration);
+ 	dt_add_property_cells(np, "aspeed,mcr-scu-mpll", mcr_scu_mpll);
+ 	dt_add_property_cells(np, "aspeed,mcr-scu-strap", mcr_scu_strap);
+-
+-	/*
+-	 * if
+-	 *    - the petitboot kernel supports an ast driver that uses DT
+-	 *    - every host kernel supports an ast driver that uses DT
+-	 *    - the host can't flash unsigned skiboots
+-	 *
+-	 * then enabling the line below will allow the host and the BMC to be
+-	 * securely isolated from each other, without changing what's running
+-	 * on the BMC.
+-	 */
+-
+-	/* ast_ahb_writel(0x79, 0x1E6E2180); */
+ }
+ 
+ /* Quirks are: {fixup function, vendor ID, (device ID or PCI_ANY_ID)} */
+-- 
+2.17.1
+

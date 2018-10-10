@@ -1,0 +1,75 @@
+From 8972e44f97883e5aabf4b9c6737dcf3b22fd24b8 Mon Sep 17 00:00:00 2001
+From: Andrew Jeffery <andrew@aj.id.au>
+Date: Tue, 17 Jul 2018 11:32:52 +0930
+Subject: [PATCH v1 4/6] ast-bmc: Rename LPC FW cycle helpers
+
+Introduce some consistency for readability and make the names better
+reflect the nature of the tests.
+
+Signed-off-by: Andrew Jeffery <andrew@aj.id.au>
+Signed-off-by: Stewart Smith <stewart@linux.ibm.com>
+---
+ hw/ast-bmc/ast-io.c     | 4 ++--
+ include/ast.h           | 4 ++--
+ platforms/astbmc/pnor.c | 4 ++--
+ 3 files changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/hw/ast-bmc/ast-io.c b/hw/ast-bmc/ast-io.c
+index 661cf406b0b2..a55287168fe3 100644
+--- a/hw/ast-bmc/ast-io.c
++++ b/hw/ast-bmc/ast-io.c
+@@ -316,12 +316,12 @@ void ast_io_init(void)
+ 	ast_setup_sio_irq_polarity();
+ }
+ 
+-bool ast_is_mbox_pnor(void)
++bool ast_lpc_fw_is_mbox(void)
+ {
+ 	return dt_find_compatible_node(dt_root, NULL, "mbox");
+ }
+ 
+-bool ast_is_ahb_lpc_pnor(void)
++bool ast_lpc_fw_is_flash(void)
+ {
+ 	uint8_t boot_version;
+ 	uint8_t boot_flags;
+diff --git a/include/ast.h b/include/ast.h
+index 5addeec7e379..3525c828a217 100644
+--- a/include/ast.h
++++ b/include/ast.h
+@@ -74,8 +74,8 @@ void ast_ahb_writel(uint32_t val, uint32_t reg);
+ uint32_t ast_ahb_readl(uint32_t reg);
+ 
+ void ast_io_init(void);
+-bool ast_is_ahb_lpc_pnor(void);
+-bool ast_is_mbox_pnor(void);
++bool ast_lpc_fw_is_flash(void);
++bool ast_lpc_fw_is_mbox(void);
+ bool ast_scratch_reg_is_mbox(void);
+ 
+ /* UART configuration */
+diff --git a/platforms/astbmc/pnor.c b/platforms/astbmc/pnor.c
+index e663055c6ab9..55784ee4594f 100644
+--- a/platforms/astbmc/pnor.c
++++ b/platforms/astbmc/pnor.c
+@@ -33,7 +33,7 @@ int pnor_init(void)
+ 	int rc;
+ 	bool do_mbox;
+ 
+-	do_mbox = ast_is_mbox_pnor();
++	do_mbox = ast_lpc_fw_is_mbox();
+ 	if (do_mbox) {
+ 		rc = mbox_flash_init(&bl);
+ 	} else {
+@@ -43,7 +43,7 @@ int pnor_init(void)
+ 		 * FW reads & writes).
+ 		 */
+ 
+-		if (ast_is_ahb_lpc_pnor())
++		if (ast_lpc_fw_is_flash())
+ 			rc = ast_sf_open(AST_SF_TYPE_PNOR, &pnor_ctrl);
+ 		else {
+ 			printf("PLAT: Memboot detected\n");
+-- 
+2.17.1
+

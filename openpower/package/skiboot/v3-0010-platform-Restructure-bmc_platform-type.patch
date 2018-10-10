@@ -1,0 +1,538 @@
+From e46288c78a2455595e434959a335062f7edfae74 Mon Sep 17 00:00:00 2001
+From: Andrew Jeffery <andrew@aj.id.au>
+Date: Tue, 25 Sep 2018 08:41:43 +0930
+Subject: [PATCH v3 10/11] platform: Restructure bmc_platform type
+
+Segregate the BMC platform configuration into hardware and software
+components. This allows population of platform default values for
+hardware configuration that may no-longer be accessible by the host.
+
+Signed-off-by: Andrew Jeffery <andrew@aj.id.au>
+---
+ core/pci-quirk.c               | 21 ++++++++++++++----
+ hw/ast-bmc/ast-io.c            |  2 +-
+ hw/ipmi/ipmi-sel.c             |  8 +++----
+ include/ast.h                  |  1 +
+ include/platform.h             | 16 ++++++++++++--
+ libflash/ipmi-hiomap.c         | 31 +++++++++++++-------------
+ platforms/astbmc/astbmc.h      |  9 ++++++--
+ platforms/astbmc/common.c      | 40 ++++++++++++++++++++++++++++++----
+ platforms/astbmc/firestone.c   |  2 +-
+ platforms/astbmc/garrison.c    |  2 +-
+ platforms/astbmc/habanero.c    |  2 +-
+ platforms/astbmc/p8dnu.c       | 11 +++++++---
+ platforms/astbmc/p8dtu.c       | 12 ++++++----
+ platforms/astbmc/p9dsu.c       | 11 +++++++---
+ platforms/astbmc/palmetto.c    |  2 +-
+ platforms/astbmc/romulus.c     |  2 +-
+ platforms/astbmc/vesnin.c      |  2 +-
+ platforms/astbmc/witherspoon.c |  2 +-
+ 18 files changed, 127 insertions(+), 49 deletions(-)
+
+diff --git a/core/pci-quirk.c b/core/pci-quirk.c
+index 7ed6b795d8c8..3a8583633d8a 100644
+--- a/core/pci-quirk.c
++++ b/core/pci-quirk.c
+@@ -14,9 +14,12 @@
+  * limitations under the License.
+  */
+ 
++#define pr_fmt(fmt)  "PCI-QUIRK: " fmt
++
+ #include <skiboot.h>
+ #include <pci.h>
+ #include <pci-quirk.h>
++#include <platform.h>
+ #include <ast.h>
+ 
+ static void quirk_astbmc_vga(struct phb *phb __unused,
+@@ -25,10 +28,20 @@ static void quirk_astbmc_vga(struct phb *phb __unused,
+ 	struct dt_node *np = pd->dn;
+ 	uint32_t revision, mcr_configuration, mcr_scu_mpll, mcr_scu_strap;
+ 
+-	revision = ast_ahb_readl(SCU_REVISION_ID);
+-	mcr_configuration = ast_ahb_readl(MCR_CONFIGURATION);
+-	mcr_scu_mpll = ast_ahb_readl(MCR_SCU_MPLL);
+-	mcr_scu_strap = ast_ahb_readl(MCR_SCU_STRAP);
++	if (ast_sio_is_enabled()) {
++		revision = ast_ahb_readl(SCU_REVISION_ID);
++		mcr_configuration = ast_ahb_readl(MCR_CONFIGURATION);
++		mcr_scu_mpll = ast_ahb_readl(MCR_SCU_MPLL);
++		mcr_scu_strap = ast_ahb_readl(MCR_SCU_STRAP);
++	} else {
++		prlog(PR_WARNING, "Assumed platform default parameters for %s\n",
++		      __func__);
++		revision = bmc_platform->hw->scu_revision_id;
++		mcr_configuration = bmc_platform->hw->mcr_configuration;
++		mcr_scu_mpll = bmc_platform->hw->mcr_scu_mpll;
++		mcr_scu_strap = bmc_platform->hw->mcr_scu_strap;
++	}
++
+ 	dt_add_property_cells(np, "aspeed,scu-revision-id", revision);
+ 	dt_add_property_cells(np, "aspeed,mcr-configuration", mcr_configuration);
+ 	dt_add_property_cells(np, "aspeed,mcr-scu-mpll", mcr_scu_mpll);
+diff --git a/hw/ast-bmc/ast-io.c b/hw/ast-bmc/ast-io.c
+index e05348487fd4..38ca86c46003 100644
+--- a/hw/ast-bmc/ast-io.c
++++ b/hw/ast-bmc/ast-io.c
+@@ -321,7 +321,7 @@ static void ast_setup_sio_irq_polarity(void)
+ 	bmc_sio_put(true);
+ }
+ 
+-static bool ast_sio_is_enabled(void)
++bool ast_sio_is_enabled(void)
+ {
+ 	int64_t rc;
+ 
+diff --git a/hw/ipmi/ipmi-sel.c b/hw/ipmi/ipmi-sel.c
+index cfcd1d424596..0996275672b4 100644
+--- a/hw/ipmi/ipmi-sel.c
++++ b/hw/ipmi/ipmi-sel.c
+@@ -334,7 +334,7 @@ static void ipmi_elog_poll(struct ipmi_msg *msg)
+ 	struct errorlog *elog_buf = (struct errorlog *) msg->user_data;
+ 	size_t req_size;
+ 
+-	if (bmc_platform->ipmi_oem_partial_add_esel == 0) {
++	if (bmc_platform->sw->ipmi_oem_partial_add_esel == 0) {
+ 		prlog(PR_WARNING, "Dropped eSEL: BMC code is buggy/missing\n");
+ 		return;
+ 	}
+@@ -392,7 +392,7 @@ static void ipmi_elog_poll(struct ipmi_msg *msg)
+ 	}
+ 
+ 	ipmi_init_msg(msg, IPMI_DEFAULT_INTERFACE,
+-		      bmc_platform->ipmi_oem_partial_add_esel,
++		      bmc_platform->sw->ipmi_oem_partial_add_esel,
+ 		      ipmi_elog_poll, elog_buf, req_size, 2);
+ 
+ 	msg->data[0] = reservation_id & 0xff;
+@@ -464,7 +464,7 @@ static void sel_pnor(uint8_t access, void *context __unused)
+ 	switch (access) {
+ 	case REQUEST_PNOR:
+ 		prlog(PR_NOTICE, "PNOR access requested\n");
+-		if (bmc_platform->ipmi_oem_pnor_access_status == 0) {
++		if (bmc_platform->sw->ipmi_oem_pnor_access_status == 0) {
+ 			/**
+ 			 * @fwts-label PNORAccessYeahButNoBut
+ 			 * @fwts-advice OPAL doesn't know that the BMC supports
+@@ -479,7 +479,7 @@ static void sel_pnor(uint8_t access, void *context __unused)
+ 		if (granted)
+ 			occ_pnor_set_owner(PNOR_OWNER_EXTERNAL);
+ 		/* Ack the request */
+-		msg = ipmi_mkmsg_simple(bmc_platform->ipmi_oem_pnor_access_status, &granted, 1);
++		msg = ipmi_mkmsg_simple(bmc_platform->sw->ipmi_oem_pnor_access_status, &granted, 1);
+ 		ipmi_queue_msg(msg);
+ 		break;
+ 	case RELEASE_PNOR:
+diff --git a/include/ast.h b/include/ast.h
+index c3e171804dee..c6684fc88265 100644
+--- a/include/ast.h
++++ b/include/ast.h
+@@ -81,6 +81,7 @@
+ void ast_ahb_writel(uint32_t val, uint32_t reg);
+ uint32_t ast_ahb_readl(uint32_t reg);
+ 
++bool ast_sio_is_enabled(void);
+ bool ast_sio_init(void);
+ bool ast_io_init(void);
+ bool ast_io_is_rw(void);
+diff --git a/include/platform.h b/include/platform.h
+index 294e06cd08d4..56f9f3d44981 100644
+--- a/include/platform.h
++++ b/include/platform.h
+@@ -34,9 +34,15 @@ enum resource_id {
+ #define RESOURCE_SUBID_NONE 0
+ #define RESOURCE_SUBID_SUPPORTED 1
+ 
+-struct bmc_platform {
+-	const char *name;
+ 
++struct bmc_hw_config {
++	uint32_t scu_revision_id;
++	uint32_t mcr_configuration;
++	uint32_t mcr_scu_mpll;
++	uint32_t mcr_scu_strap;
++};
++
++struct bmc_sw_config {
+ 	/*
+ 	 * Map IPMI_OEM_X to vendor commands for this BMC
+ 	 * 0 = unimplimented
+@@ -46,6 +52,12 @@ struct bmc_platform {
+ 	uint32_t ipmi_oem_hiomap_cmd;
+ };
+ 
++struct bmc_platform {
++	const char *name;
++	const struct bmc_hw_config *hw;
++	const struct bmc_sw_config *sw;
++};
++
+ /* OpenCAPI platform-specific I2C information */
+ struct platform_ocapi {
+ 	uint8_t i2c_engine;		/* I2C engine number */
+diff --git a/libflash/ipmi-hiomap.c b/libflash/ipmi-hiomap.c
+index 780ffdf2caae..176a872fb00e 100644
+--- a/libflash/ipmi-hiomap.c
++++ b/libflash/ipmi-hiomap.c
+@@ -226,8 +226,8 @@ static bool hiomap_get_info(struct ipmi_hiomap *ctx)
+ 	req[2] = HIOMAP_V2;
+ 
+ 	msg = ipmi_mkmsg(IPMI_DEFAULT_INTERFACE,
+-		         bmc_platform->ipmi_oem_hiomap_cmd, ipmi_hiomap_cmd_cb,
+-			 &res, req, sizeof(req), 6);
++		         bmc_platform->sw->ipmi_oem_hiomap_cmd,
++			 ipmi_hiomap_cmd_cb, &res, req, sizeof(req), 6);
+ 	ipmi_queue_msg_sync(msg);
+ 
+ 	if (res.cc != IPMI_CC_NO_ERROR) {
+@@ -251,8 +251,8 @@ static bool hiomap_get_flash_info(struct ipmi_hiomap *ctx)
+ 	req[0] = HIOMAP_C_GET_FLASH_INFO;
+ 	req[1] = ++ctx->seq;
+ 	msg = ipmi_mkmsg(IPMI_DEFAULT_INTERFACE,
+-		         bmc_platform->ipmi_oem_hiomap_cmd, ipmi_hiomap_cmd_cb,
+-			 &res, req, sizeof(req), 2 + 2 + 2);
++		         bmc_platform->sw->ipmi_oem_hiomap_cmd,
++			 ipmi_hiomap_cmd_cb, &res, req, sizeof(req), 2 + 2 + 2);
+ 	ipmi_queue_msg_sync(msg);
+ 
+ 	if (res.cc != IPMI_CC_NO_ERROR) {
+@@ -294,8 +294,9 @@ static bool hiomap_window_move(struct ipmi_hiomap *ctx, uint8_t command,
+ 	unlock(&ctx->lock);
+ 
+ 	msg = ipmi_mkmsg(IPMI_DEFAULT_INTERFACE,
+-		         bmc_platform->ipmi_oem_hiomap_cmd, ipmi_hiomap_cmd_cb,
+-			 &res, req, sizeof(req), 2 + 2 + 2 + 2);
++		         bmc_platform->sw->ipmi_oem_hiomap_cmd,
++			 ipmi_hiomap_cmd_cb, &res, req, sizeof(req),
++			 2 + 2 + 2 + 2);
+ 	ipmi_queue_msg_sync(msg);
+ 
+ 	if (res.cc != IPMI_CC_NO_ERROR) {
+@@ -348,8 +349,8 @@ static bool hiomap_mark_dirty(struct ipmi_hiomap *ctx, uint64_t offset,
+ 	range->size = cpu_to_le16(bytes_to_blocks(ctx, size));
+ 
+ 	msg = ipmi_mkmsg(IPMI_DEFAULT_INTERFACE,
+-		         bmc_platform->ipmi_oem_hiomap_cmd, ipmi_hiomap_cmd_cb,
+-			 &res, req, sizeof(req), 2);
++		         bmc_platform->sw->ipmi_oem_hiomap_cmd,
++			 ipmi_hiomap_cmd_cb, &res, req, sizeof(req), 2);
+ 	ipmi_queue_msg_sync(msg);
+ 
+ 	if (res.cc != IPMI_CC_NO_ERROR) {
+@@ -381,8 +382,8 @@ static bool hiomap_flush(struct ipmi_hiomap *ctx)
+ 	req[1] = ++ctx->seq;
+ 
+ 	msg = ipmi_mkmsg(IPMI_DEFAULT_INTERFACE,
+-		         bmc_platform->ipmi_oem_hiomap_cmd, ipmi_hiomap_cmd_cb,
+-			 &res, req, sizeof(req), 2);
++		         bmc_platform->sw->ipmi_oem_hiomap_cmd,
++			 ipmi_hiomap_cmd_cb, &res, req, sizeof(req), 2);
+ 	ipmi_queue_msg_sync(msg);
+ 
+ 	if (res.cc != IPMI_CC_NO_ERROR) {
+@@ -406,8 +407,8 @@ static bool hiomap_ack(struct ipmi_hiomap *ctx, uint8_t ack)
+ 	req[2] = ack;
+ 
+ 	msg = ipmi_mkmsg(IPMI_DEFAULT_INTERFACE,
+-		         bmc_platform->ipmi_oem_hiomap_cmd, ipmi_hiomap_cmd_cb,
+-			 &res, req, sizeof(req), 2);
++		         bmc_platform->sw->ipmi_oem_hiomap_cmd,
++			 ipmi_hiomap_cmd_cb, &res, req, sizeof(req), 2);
+ 	ipmi_queue_msg_sync(msg);
+ 
+ 	if (res.cc != IPMI_CC_NO_ERROR) {
+@@ -446,8 +447,8 @@ static bool hiomap_erase(struct ipmi_hiomap *ctx, uint64_t offset,
+ 	range->size = cpu_to_le16(bytes_to_blocks(ctx, size));
+ 
+ 	msg = ipmi_mkmsg(IPMI_DEFAULT_INTERFACE,
+-		         bmc_platform->ipmi_oem_hiomap_cmd, ipmi_hiomap_cmd_cb,
+-			 &res, req, sizeof(req), 2);
++		         bmc_platform->sw->ipmi_oem_hiomap_cmd,
++			 ipmi_hiomap_cmd_cb, &res, req, sizeof(req), 2);
+ 	ipmi_queue_msg_sync(msg);
+ 
+ 	if (res.cc != IPMI_CC_NO_ERROR) {
+@@ -787,7 +788,7 @@ int ipmi_hiomap_init(struct blocklevel_device **bl)
+ 	struct ipmi_hiomap *ctx;
+ 	int rc;
+ 
+-	if (!bmc_platform->ipmi_oem_hiomap_cmd)
++	if (!bmc_platform->sw->ipmi_oem_hiomap_cmd)
+ 		/* FIXME: Find a better error code */
+ 		return FLASH_ERR_DEVICE_GONE;
+ 
+diff --git a/platforms/astbmc/astbmc.h b/platforms/astbmc/astbmc.h
+index 16ffd7dff785..fe358b7491bb 100644
+--- a/platforms/astbmc/astbmc.h
++++ b/platforms/astbmc/astbmc.h
+@@ -18,6 +18,8 @@
+ #ifndef __ASTBMC_H
+ #define __ASTBMC_H
+ 
++#include <platform.h>
++
+ #define ST_LOC_PHB(chip_id, phb_idx)    ((chip_id) << 16 | (phb_idx))
+ #define ST_LOC_DEVFN(dev, fn)	        ((dev) << 3 | (fn))
+ /*
+@@ -87,8 +89,11 @@ static struct slot_table_entry st_name[] = \
+ 	##__VA_ARGS__ \
+ }
+ 
+-extern const struct bmc_platform astbmc_ami;
+-extern const struct bmc_platform astbmc_openbmc;
++extern const struct bmc_hw_config bmc_hw_ast2400;
++extern const struct bmc_hw_config bmc_hw_ast2500;
++extern const struct bmc_platform bmc_plat_ast2400_ami;
++extern const struct bmc_platform bmc_plat_ast2500_ami;
++extern const struct bmc_platform bmc_plat_ast2500_openbmc;
+ 
+ extern void astbmc_early_init(void);
+ extern int64_t astbmc_ipmi_reboot(void);
+diff --git a/platforms/astbmc/common.c b/platforms/astbmc/common.c
+index 0cf70e260d94..10aed3f72901 100644
+--- a/platforms/astbmc/common.c
++++ b/platforms/astbmc/common.c
+@@ -427,14 +427,46 @@ void astbmc_exit(void)
+ 	ipmi_wdt_final_reset();
+ }
+ 
+-const struct bmc_platform astbmc_ami = {
+-	.name = "AMI",
++const struct bmc_sw_config bmc_sw_ami = {
+ 	.ipmi_oem_partial_add_esel   = IPMI_CODE(0x3a, 0xf0),
+ 	.ipmi_oem_pnor_access_status = IPMI_CODE(0x3a, 0x07),
+ };
+ 
+-const struct bmc_platform astbmc_openbmc = {
+-	.name = "OpenBMC",
++const struct bmc_sw_config bmc_sw_openbmc = {
+ 	.ipmi_oem_partial_add_esel   = IPMI_CODE(0x3a, 0xf0),
+ 	.ipmi_oem_hiomap_cmd         = IPMI_CODE(0x3a, 0x5a),
+ };
++
++/* Extracted from a Palmetto */
++const struct bmc_hw_config bmc_hw_ast2400 = {
++	.scu_revision_id = 0x2010303,
++	.mcr_configuration = 0x00000577,
++	.mcr_scu_mpll = 0x000050c0,
++	.mcr_scu_strap = 0x00000000,
++};
++
++/* Extracted from a Witherspoon */
++const struct bmc_hw_config bmc_hw_ast2500 = {
++	.scu_revision_id = 0x04030303,
++	.mcr_configuration = 0x11200756,
++	.mcr_scu_mpll = 0x000071C1,
++	.mcr_scu_strap = 0x00000000,
++};
++
++const struct bmc_platform bmc_plat_ast2400_ami = {
++	.name = "ast2400:ami",
++	.hw = &bmc_hw_ast2400,
++	.sw = &bmc_sw_ami,
++};
++
++const struct bmc_platform bmc_plat_ast2500_ami = {
++	.name = "ast2500:ami",
++	.hw = &bmc_hw_ast2500,
++	.sw = &bmc_sw_ami,
++};
++
++const struct bmc_platform bmc_plat_ast2500_openbmc = {
++	.name = "ast2500:openbmc",
++	.hw = &bmc_hw_ast2500,
++	.sw = &bmc_sw_openbmc,
++};
+diff --git a/platforms/astbmc/firestone.c b/platforms/astbmc/firestone.c
+index fc6575b13728..28719e300fb0 100644
+--- a/platforms/astbmc/firestone.c
++++ b/platforms/astbmc/firestone.c
+@@ -146,7 +146,7 @@ static bool firestone_probe(void)
+ 
+ DECLARE_PLATFORM(firestone) = {
+ 	.name			= "Firestone",
+-	.bmc			= &astbmc_ami,
++	.bmc			= &bmc_plat_ast2400_ami,
+ 	.probe			= firestone_probe,
+ 	.init			= astbmc_init,
+ 	.pci_get_slot_info	= slot_table_get_slot_info,
+diff --git a/platforms/astbmc/garrison.c b/platforms/astbmc/garrison.c
+index db886cbbfd63..6c914fd2e542 100644
+--- a/platforms/astbmc/garrison.c
++++ b/platforms/astbmc/garrison.c
+@@ -293,7 +293,7 @@ static bool garrison_probe(void)
+ 
+ DECLARE_PLATFORM(garrison) = {
+ 	.name			= "Garrison",
+-	.bmc			= &astbmc_ami,
++	.bmc			= &bmc_plat_ast2400_ami,
+ 	.probe			= garrison_probe,
+ 	.init			= astbmc_init,
+ 	.pci_get_slot_info	= slot_table_get_slot_info,
+diff --git a/platforms/astbmc/habanero.c b/platforms/astbmc/habanero.c
+index 2856a9774c8e..8e11b81efe1e 100644
+--- a/platforms/astbmc/habanero.c
++++ b/platforms/astbmc/habanero.c
+@@ -136,7 +136,7 @@ static bool habanero_probe(void)
+ 
+ DECLARE_PLATFORM(habanero) = {
+ 	.name			= "Habanero",
+-	.bmc			= &astbmc_ami,
++	.bmc			= &bmc_plat_ast2400_ami,
+ 	.probe			= habanero_probe,
+ 	.init			= astbmc_init,
+ 	.pci_get_slot_info	= slot_table_get_slot_info,
+diff --git a/platforms/astbmc/p8dnu.c b/platforms/astbmc/p8dnu.c
+index e4aeed4712eb..d808c69f29d8 100644
+--- a/platforms/astbmc/p8dnu.c
++++ b/platforms/astbmc/p8dnu.c
+@@ -337,16 +337,21 @@ static bool p8dnu_probe(void)
+ 	return true;
+ }
+ 
+-static const struct bmc_platform astbmc_smc = {
+-	.name = "SMC",
++static const struct bmc_sw_config bmc_sw_smc = {
+ 	.ipmi_oem_partial_add_esel   = IPMI_CODE(0x3a, 0xf0),
+ 	.ipmi_oem_pnor_access_status = IPMI_CODE(0x3a, 0x07),
+ };
+ 
++static const struct bmc_platform bmc_plat_ast2400_smc = {
++	.name = "SMC",
++	.hw = &bmc_hw_ast2400,
++	.sw = &bmc_sw_smc,
++};
++
+ DECLARE_PLATFORM(p8dnu) = {
+ 	.name			= "P8DNU",
+ 	.probe			= p8dnu_probe,
+-	.bmc			= &astbmc_smc,
++	.bmc			= &bmc_plat_ast2400_smc,
+ 	.init			= astbmc_init,
+ 	.pci_get_slot_info	= slot_table_get_slot_info,
+ 	.cec_power_down         = astbmc_ipmi_power_down,
+diff --git a/platforms/astbmc/p8dtu.c b/platforms/astbmc/p8dtu.c
+index 63d36fb65deb..b5627d2c775d 100644
+--- a/platforms/astbmc/p8dtu.c
++++ b/platforms/astbmc/p8dtu.c
+@@ -227,17 +227,21 @@ static bool p8dtu2u_probe(void)
+ 	return true;
+ }
+ 
+-static const struct bmc_platform astbmc_smc = {
+-	.name = "SMC",
++static const struct bmc_sw_config bmc_sw_smc = {
+ 	.ipmi_oem_partial_add_esel   = IPMI_CODE(0x3a, 0xf0),
+ 	.ipmi_oem_pnor_access_status = IPMI_CODE(0x3a, 0x07),
+ };
+ 
++static const struct bmc_platform bmc_plat_ast2400_smc = {
++	.name = "SMC",
++	.hw = &bmc_hw_ast2400,
++	.sw = &bmc_sw_smc,
++};
+ 
+ DECLARE_PLATFORM(p8dtu1u) = {
+ 	.name			= "p8dtu1u",
+ 	.probe			= p8dtu1u_probe,
+-	.bmc			= &astbmc_smc,
++	.bmc			= &bmc_plat_ast2400_smc,
+ 	.init			= astbmc_init,
+ 	.pci_get_slot_info	= slot_table_get_slot_info,
+ 	.pci_probe_complete	= check_all_slot_table,
+@@ -254,7 +258,7 @@ DECLARE_PLATFORM(p8dtu1u) = {
+ DECLARE_PLATFORM(p8dtu2u) = {
+ 	.name			= "p8dtu2u",
+ 	.probe			= p8dtu2u_probe,
+-	.bmc			= &astbmc_smc,
++	.bmc			= &bmc_plat_ast2400_smc,
+ 	.init			= astbmc_init,
+ 	.pci_get_slot_info	= slot_table_get_slot_info,
+ 	.pci_probe_complete	= check_all_slot_table,
+diff --git a/platforms/astbmc/p9dsu.c b/platforms/astbmc/p9dsu.c
+index e14b0716b74f..234d25ce6a35 100644
+--- a/platforms/astbmc/p9dsu.c
++++ b/platforms/astbmc/p9dsu.c
+@@ -683,18 +683,23 @@ static void p9dsu_init(void)
+ 	}
+ }
+ 
+-static const struct bmc_platform astbmc_smc = {
+-	.name = "SMC",
++static const struct bmc_sw_config bmc_sw_smc = {
+ 	.ipmi_oem_partial_add_esel   = IPMI_CODE(0x3a, 0xf0),
+ };
+ 
++static const struct bmc_platform bmc_plat_ast2500_smc = {
++	.name = "SMC",
++	.hw = &bmc_hw_ast2500,
++	.sw = &bmc_sw_smc,
++};
++
+ DECLARE_PLATFORM(p9dsu1u) = {
+ 	.name			= "p9dsu",
+ 	.probe			= p9dsu_probe,
+ 	.init			= p9dsu_init,
+ 	.start_preload_resource	= flash_start_preload_resource,
+ 	.resource_loaded	= flash_resource_loaded,
+-	.bmc			= &astbmc_smc,
++	.bmc			= &bmc_plat_ast2500_smc,
+ 	.pci_get_slot_info	= slot_table_get_slot_info,
+ 	.cec_power_down         = astbmc_ipmi_power_down,
+ 	.cec_reboot             = astbmc_ipmi_reboot,
+diff --git a/platforms/astbmc/palmetto.c b/platforms/astbmc/palmetto.c
+index 69f111c72b4f..29739c03b771 100644
+--- a/platforms/astbmc/palmetto.c
++++ b/platforms/astbmc/palmetto.c
+@@ -121,7 +121,7 @@ static bool palmetto_probe(void)
+ DECLARE_PLATFORM(palmetto) = {
+ 	.name			= "Palmetto",
+ 	.probe			= palmetto_probe,
+-	.bmc			= &astbmc_ami,
++	.bmc			= &bmc_plat_ast2400_ami,
+ 	.init			= astbmc_init,
+ 	.pci_get_slot_info	= slot_table_get_slot_info,
+ 	.pci_probe_complete	= check_all_slot_table,
+diff --git a/platforms/astbmc/romulus.c b/platforms/astbmc/romulus.c
+index 67c594638b8d..7bb07cce5363 100644
+--- a/platforms/astbmc/romulus.c
++++ b/platforms/astbmc/romulus.c
+@@ -74,7 +74,7 @@ DECLARE_PLATFORM(romulus) = {
+ 	.init			= astbmc_init,
+ 	.start_preload_resource	= flash_start_preload_resource,
+ 	.resource_loaded	= flash_resource_loaded,
+-	.bmc			= &astbmc_openbmc,
++	.bmc			= &bmc_plat_ast2500_openbmc,
+ 	.pci_get_slot_info	= slot_table_get_slot_info,
+ 	.pci_probe_complete	= check_all_slot_table,
+ 	.cec_power_down         = astbmc_ipmi_power_down,
+diff --git a/platforms/astbmc/vesnin.c b/platforms/astbmc/vesnin.c
+index d7df191b77b0..62eb3403a7da 100644
+--- a/platforms/astbmc/vesnin.c
++++ b/platforms/astbmc/vesnin.c
+@@ -247,7 +247,7 @@ static bool vesnin_probe(void)
+ 
+ DECLARE_PLATFORM(vesnin) = {
+ 	.name			= "vesnin",
+-	.bmc			= &astbmc_ami,
++	.bmc			= &bmc_plat_ast2400_ami,
+ 	.probe			= vesnin_probe,
+ 	.init			= astbmc_init,
+ 	.pci_get_slot_info	= slot_table_get_slot_info,
+diff --git a/platforms/astbmc/witherspoon.c b/platforms/astbmc/witherspoon.c
+index 3c9dbc90d8a5..f45f739fbb2c 100644
+--- a/platforms/astbmc/witherspoon.c
++++ b/platforms/astbmc/witherspoon.c
+@@ -364,7 +364,7 @@ DECLARE_PLATFORM(witherspoon) = {
+ 	.pre_pci_fixup		= witherspoon_shared_slot_fixup,
+ 	.start_preload_resource	= flash_start_preload_resource,
+ 	.resource_loaded	= flash_resource_loaded,
+-	.bmc			= &astbmc_openbmc,
++	.bmc			= &bmc_plat_ast2500_openbmc,
+ 	.cec_power_down         = astbmc_ipmi_power_down,
+ 	.cec_reboot             = astbmc_ipmi_reboot,
+ 	.elog_commit		= ipmi_elog_commit,
+-- 
+2.17.1
+

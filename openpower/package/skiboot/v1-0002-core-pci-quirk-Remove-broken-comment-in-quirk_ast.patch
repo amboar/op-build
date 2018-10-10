@@ -1,0 +1,44 @@
+From 467b00fdfd67add51bc54a62c7c70d14a9925717 Mon Sep 17 00:00:00 2001
+From: Andrew Jeffery <andrew@aj.id.au>
+Date: Tue, 17 Jul 2018 11:32:50 +0930
+Subject: [PATCH v1 2/6] core/pci-quirk: Remove broken comment in
+ quirk_astbmc_vga()
+
+The comment talks about one mechanism to handle the quirk whilst the
+code uses another. Avoid confusion by removing the comment.
+
+Signed-off-by: Andrew Jeffery <andrew@aj.id.au>
+Signed-off-by: Stewart Smith <stewart@linux.ibm.com>
+---
+ core/pci-quirk.c | 15 ---------------
+ 1 file changed, 15 deletions(-)
+
+diff --git a/core/pci-quirk.c b/core/pci-quirk.c
+index 1b60e921db72..983240734c16 100644
+--- a/core/pci-quirk.c
++++ b/core/pci-quirk.c
+@@ -25,21 +25,6 @@ static void quirk_astbmc_vga(struct phb *phb __unused,
+ 	struct dt_node *np = pd->dn;
+ 	uint32_t revision, mcr_configuration, mcr_scu_mpll, mcr_scu_strap;
+ 
+-	/*
+-	 * These accesses will only work if the BMC address 0x1E6E2180 is set
+-	 * to 0x7B, which is its default state on current systems.  In future,
+-	 * for security purposes it is proposed to configure this register to
+-	 * disallow accesses from the host, and provide the properties that
+-	 * the Linux ast VGA driver used through the device tree instead.
+-	 * Here we set those properties so we can test how things would work
+-	 * if the window into BMC memory was closed.
+-	 *
+-	 * If both the petitboot kernel and the host kernel have an ast driver
+-	 * that reads properties from the device tree, setting 0x1E6E2180 to
+-	 * 0x79 will disable the backdoor into BMC memory and the only way the
+-	 * ast driver can operate is using the device tree properties.
+-	 */
+-
+ 	revision = ast_ahb_readl(SCU_REVISION_ID);
+ 	mcr_configuration = ast_ahb_readl(MCR_CONFIGURATION);
+ 	mcr_scu_mpll = ast_ahb_readl(MCR_SCU_MPLL);
+-- 
+2.17.1
+

@@ -1,0 +1,284 @@
+From 5b1bc2ffe791ae94361d86b2ae063ee543bf2df5 Mon Sep 17 00:00:00 2001
+From: Andrew Jeffery <andrew@aj.id.au>
+Date: Tue, 17 Jul 2018 11:32:49 +0930
+Subject: [PATCH v1 1/6] ast-bmc: Move copy routines to ast-sf-ctrl
+
+The only user was hw/ast-bmc/ast-sf-ctrl.c, and for accessing flash the
+copy routines require knowledge of the PNOR LPC offset. For systems
+using MBOX the ast-sf-ctrl implementation is unused, so move the offset
+initialisation out of the common code-path and the copy routines to the
+place where they are necessary.
+
+Signed-off-by: Andrew Jeffery <andrew@aj.id.au>
+Signed-off-by: Stewart Smith <stewart@linux.ibm.com>
+---
+ hw/ast-bmc/ast-io.c      | 94 ----------------------------------------
+ hw/ast-bmc/ast-sf-ctrl.c | 94 ++++++++++++++++++++++++++++++++++++++++
+ include/ast.h            |  6 ---
+ 3 files changed, 94 insertions(+), 100 deletions(-)
+
+diff --git a/hw/ast-bmc/ast-io.c b/hw/ast-bmc/ast-io.c
+index 964d41513379..661cf406b0b2 100644
+--- a/hw/ast-bmc/ast-io.c
++++ b/hw/ast-bmc/ast-io.c
+@@ -248,8 +248,6 @@ static uint32_t bmc_sio_ahb_readl(uint32_t reg)
+  * We could support all access sizes via iLPC but we don't need
+  * that for now.
+  */
+-#define PNOR_AHB_ADDR	0x30000000
+-static uint32_t pnor_lpc_offset;
+ 
+ void ast_ahb_writel(uint32_t val, uint32_t reg)
+ {
+@@ -263,87 +261,6 @@ uint32_t ast_ahb_readl(uint32_t reg)
+ 	return bmc_sio_ahb_readl(reg);
+ }
+ 
+-int ast_copy_to_ahb(uint32_t reg, const void *src, uint32_t len)
+-{
+-	/* Check we don't cross IDSEL segments */
+-	if ((reg ^ (reg + len - 1)) >> 28)
+-		return -EINVAL;
+-
+-	/* SPI flash, use LPC->AHB bridge */
+-	if ((reg >> 28) == (PNOR_AHB_ADDR >> 28)) {
+-		uint32_t chunk, off = reg - PNOR_AHB_ADDR + pnor_lpc_offset;
+-		int64_t rc;
+-
+-		while(len) {
+-			/* Chose access size */
+-			if (len > 3 && !(off & 3)) {
+-				rc = lpc_write(OPAL_LPC_FW, off,
+-					       *(uint32_t *)src, 4);
+-				chunk = 4;
+-			} else {
+-				rc = lpc_write(OPAL_LPC_FW, off,
+-					       *(uint8_t *)src, 1);
+-				chunk = 1;
+-			}
+-			if (rc) {
+-				prerror("AST_IO: lpc_write.sb failure %lld"
+-					" to FW 0x%08x\n", rc, off);
+-				return rc;
+-			}
+-			len -= chunk;
+-			off += chunk;
+-			src += chunk;
+-		}
+-		return 0;
+-	}
+-
+-	/* Otherwise we don't do byte access (... yet)  */
+-	prerror("AST_IO: Attempted write bytes access to %08x\n", reg);
+-	return -EINVAL;
+-}
+-
+-int ast_copy_from_ahb(void *dst, uint32_t reg, uint32_t len)
+-{
+-	/* Check we don't cross IDSEL segments */
+-	if ((reg ^ (reg + len - 1)) >> 28)
+-		return -EINVAL;
+-
+-	/* SPI flash, use LPC->AHB bridge */
+-	if ((reg >> 28) == (PNOR_AHB_ADDR >> 28)) {
+-		uint32_t chunk, off = reg - PNOR_AHB_ADDR + pnor_lpc_offset;
+-		int64_t rc;
+-
+-		while(len) {
+-			uint32_t dat;
+-
+-			/* Chose access size */
+-			if (len > 3 && !(off & 3)) {
+-				rc = lpc_read(OPAL_LPC_FW, off, &dat, 4);
+-				if (!rc)
+-					*(uint32_t *)dst = dat;
+-				chunk = 4;
+-			} else {
+-				rc = lpc_read(OPAL_LPC_FW, off, &dat, 1);
+-				if (!rc)
+-					*(uint8_t *)dst = dat;
+-				chunk = 1;
+-			}
+-			if (rc) {
+-				prerror("AST_IO: lpc_read.sb failure %lld"
+-					" to FW 0x%08x\n", rc, off);
+-				return rc;
+-			}
+-			len -= chunk;
+-			off += chunk;
+-			dst += chunk;
+-		}
+-		return 0;
+-	}
+-	/* Otherwise we don't do byte access (... yet)  */
+-	prerror("AST_IO: Attempted read bytes access to %08x\n", reg);
+-	return -EINVAL;
+-}
+-
+ static void ast_setup_sio_irq_polarity(void)
+ {
+ 	/* Select logical dev 2 */
+@@ -395,17 +312,6 @@ static void ast_setup_sio_irq_polarity(void)
+ 
+ void ast_io_init(void)
+ {
+-	uint32_t hicr7;
+-
+-	/* Read the configuration of the LPC->AHB bridge for PNOR
+-	 * to extract the PNOR LPC offset which can be different
+-	 * depending on flash size
+-	 */
+-
+-	hicr7 = bmc_sio_ahb_readl(LPC_HICR7);
+-	pnor_lpc_offset = (hicr7 & 0xffffu) << 16;
+-	prlog(PR_DEBUG, "AST: PNOR LPC offset: 0x%08x\n", pnor_lpc_offset);
+-
+ 	/* Configure all AIO interrupts to level low */
+ 	ast_setup_sio_irq_polarity();
+ }
+diff --git a/hw/ast-bmc/ast-sf-ctrl.c b/hw/ast-bmc/ast-sf-ctrl.c
+index bc877d7cf2fe..e8c1fe1444eb 100644
+--- a/hw/ast-bmc/ast-sf-ctrl.c
++++ b/hw/ast-bmc/ast-sf-ctrl.c
+@@ -22,6 +22,7 @@
+ 
+ #include <libflash/libflash.h>
+ #include <libflash/libflash-priv.h>
++#include <lpc.h>
+ 
+ #include "ast.h"
+ 
+@@ -68,6 +69,90 @@ static const uint32_t ast_ct_hclk_divs[] = {
+ 	0xd, /* HCLK/5 */
+ };
+ 
++#define PNOR_AHB_ADDR	0x30000000
++static uint32_t pnor_lpc_offset;
++
++static int ast_copy_to_ahb(uint32_t reg, const void *src, uint32_t len)
++{
++	/* Check we don't cross IDSEL segments */
++	if ((reg ^ (reg + len - 1)) >> 28)
++		return -EINVAL;
++
++	/* SPI flash, use LPC->AHB bridge */
++	if ((reg >> 28) == (PNOR_AHB_ADDR >> 28)) {
++		uint32_t chunk, off = reg - PNOR_AHB_ADDR + pnor_lpc_offset;
++		int64_t rc;
++
++		while(len) {
++			/* Chose access size */
++			if (len > 3 && !(off & 3)) {
++				rc = lpc_write(OPAL_LPC_FW, off,
++					       *(uint32_t *)src, 4);
++				chunk = 4;
++			} else {
++				rc = lpc_write(OPAL_LPC_FW, off,
++					       *(uint8_t *)src, 1);
++				chunk = 1;
++			}
++			if (rc) {
++				prerror("AST_IO: lpc_write.sb failure %lld"
++					" to FW 0x%08x\n", rc, off);
++				return rc;
++			}
++			len -= chunk;
++			off += chunk;
++			src += chunk;
++		}
++		return 0;
++	}
++
++	/* Otherwise we don't do byte access (... yet)  */
++	prerror("AST_IO: Attempted write bytes access to %08x\n", reg);
++	return -EINVAL;
++}
++
++static int ast_copy_from_ahb(void *dst, uint32_t reg, uint32_t len)
++{
++	/* Check we don't cross IDSEL segments */
++	if ((reg ^ (reg + len - 1)) >> 28)
++		return -EINVAL;
++
++	/* SPI flash, use LPC->AHB bridge */
++	if ((reg >> 28) == (PNOR_AHB_ADDR >> 28)) {
++		uint32_t chunk, off = reg - PNOR_AHB_ADDR + pnor_lpc_offset;
++		int64_t rc;
++
++		while(len) {
++			uint32_t dat;
++
++			/* Chose access size */
++			if (len > 3 && !(off & 3)) {
++				rc = lpc_read(OPAL_LPC_FW, off, &dat, 4);
++				if (!rc)
++					*(uint32_t *)dst = dat;
++				chunk = 4;
++			} else {
++				rc = lpc_read(OPAL_LPC_FW, off, &dat, 1);
++				if (!rc)
++					*(uint8_t *)dst = dat;
++				chunk = 1;
++			}
++			if (rc) {
++				prerror("AST_IO: lpc_read.sb failure %lld"
++					" to FW 0x%08x\n", rc, off);
++				return rc;
++			}
++			len -= chunk;
++			off += chunk;
++			dst += chunk;
++		}
++		return 0;
++	}
++	/* Otherwise we don't do byte access (... yet)  */
++	prerror("AST_IO: Attempted read bytes access to %08x\n", reg);
++	return -EINVAL;
++}
++
+ static int ast_sf_start_cmd(struct ast_sf_ctrl *ct, uint8_t cmd)
+ {
+ 	/* Switch to user mode, CE# dropped */
+@@ -857,6 +942,7 @@ static int ast_mem_erase(struct spi_flash_ctrl *ctrl, uint32_t addr, uint32_t si
+ int ast_sf_open(uint8_t type, struct spi_flash_ctrl **ctrl)
+ {
+ 	struct ast_sf_ctrl *ct;
++	uint32_t hicr7;
+ 
+ 	if (type != AST_SF_TYPE_PNOR && type != AST_SF_TYPE_BMC
+ 	    && type != AST_SF_TYPE_MEM)
+@@ -899,6 +985,14 @@ int ast_sf_open(uint8_t type, struct spi_flash_ctrl **ctrl)
+ 			goto fail;
+ 	}
+ 
++	/* Read the configuration of the LPC->AHB bridge for PNOR
++	 * to extract the PNOR LPC offset which can be different
++	 * depending on flash size
++	 */
++	hicr7 = ast_ahb_readl(LPC_HICR7);
++	pnor_lpc_offset = (hicr7 & 0xffffu) << 16;
++	prlog(PR_DEBUG, "AST: PNOR LPC offset: 0x%08x\n", pnor_lpc_offset);
++
+ 	*ctrl = &ct->ops;
+ 
+ 	return 0;
+diff --git a/include/ast.h b/include/ast.h
+index 2c1336b2a79b..5addeec7e379 100644
+--- a/include/ast.h
++++ b/include/ast.h
+@@ -73,12 +73,6 @@
+ void ast_ahb_writel(uint32_t val, uint32_t reg);
+ uint32_t ast_ahb_readl(uint32_t reg);
+ 
+-/*
+- * copy to/from accessors. Cannot cross IDSEL boundaries (256M)
+- */
+-int ast_copy_to_ahb(uint32_t reg, const void *src, uint32_t len);
+-int ast_copy_from_ahb(void *dst, uint32_t reg, uint32_t len);
+-
+ void ast_io_init(void);
+ bool ast_is_ahb_lpc_pnor(void);
+ bool ast_is_mbox_pnor(void);
+-- 
+2.17.1
+

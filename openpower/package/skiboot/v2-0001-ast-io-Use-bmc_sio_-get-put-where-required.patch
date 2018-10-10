@@ -1,0 +1,43 @@
+From 8bb4a1cd9af489f8e4a89fd77d89fecc6e387cc8 Mon Sep 17 00:00:00 2001
+From: Andrew Jeffery <andrew@aj.id.au>
+Date: Fri, 27 Jul 2018 17:03:45 +0930
+Subject: [PATCH v2] ast-io: Use bmc_sio_{get, put}() where required
+
+Booting the host with a particular BMC configuration could lead to the
+following error appearing in the OPAL msglog:
+
+	[   71.470748378,3] PLAT: AST IO initialisation failed!
+
+Wrap access to BMC_SIO_PLAT_FLAGS in bmc_sio_get()/bmc_sio_put() in
+order to unlock and relock the SuperIO controller as required and avoid
+the failure.
+
+Fixes: ebc8524a3a45 ("ast-io: Rework setup/tear-down of communication with the BMC")
+Signed-off-by: Andrew Jeffery <andrew@aj.id.au>
+Signed-off-by: Stewart Smith <stewart@linux.ibm.com>
+---
+ hw/ast-bmc/ast-io.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/hw/ast-bmc/ast-io.c b/hw/ast-bmc/ast-io.c
+index 4277e2d10ec3..a6ae85a4d24f 100644
+--- a/hw/ast-bmc/ast-io.c
++++ b/hw/ast-bmc/ast-io.c
+@@ -407,7 +407,13 @@ bool ast_sio_disable(void)
+ 
+ bool ast_can_isolate_sp(void)
+ {
+-	return bmc_sio_inb(BMC_SIO_PLAT_FLAGS) & BMC_SIO_PLAT_ISOLATE_SP;
++	bool isolate;
++
++	bmc_sio_get(BMC_SIO_DEV_LPC2AHB);
++	isolate = bmc_sio_inb(BMC_SIO_PLAT_FLAGS) & BMC_SIO_PLAT_ISOLATE_SP;
++	bmc_sio_put(true);
++
++	return isolate;
+ }
+ 
+ bool ast_io_is_rw(void)
+-- 
+2.17.1
+

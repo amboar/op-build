@@ -1,0 +1,30 @@
+From 53fb47da824c36c55efa887a48c8ee3bfbfcd414 Mon Sep 17 00:00:00 2001
+From: Andrew Jeffery <andrew@aj.id.au>
+Date: Mon, 27 Aug 2018 13:52:55 +0930
+Subject: [PATCH v3 02/11] core/lock: Use try_lock_caller() in lock_caller() to
+ capture owner
+
+Otherwise we can get reports of core/lock.c owning the lock, which is
+not helpful when tracking down ownership issues.
+
+Signed-off-by: Andrew Jeffery <andrew@aj.id.au>
+---
+ core/lock.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/core/lock.c b/core/lock.c
+index fca8f465f262..a26d6621bbd0 100644
+--- a/core/lock.c
++++ b/core/lock.c
+@@ -230,7 +230,7 @@ void lock_caller(struct lock *l, const char *owner)
+ 
+ 	lock_check(l);
+ 
+-	if (try_lock(l))
++	if (try_lock_caller(l, owner))
+ 		return;
+ 	add_lock_request(l);
+ 
+-- 
+2.17.1
+
