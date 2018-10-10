@@ -11,7 +11,6 @@ Reviewed-by: William A. Bryan <wilbryan@us.ibm.com>
 Tested-by: William A. Bryan <wilbryan@us.ibm.com>
 ---
  src/occ_405/incl/common_types.h     |   2 +-
- src/occ_405/occbuildname.c          |   2 +-
  src/occ_gpe0/firdata/ast_mboxdd.c   | 197 ++++++-------
  src/occ_gpe0/firdata/ast_mboxdd.h   |   2 +-
  src/occ_gpe0/firdata/ipmidd.C       | 410 ++++++++++++++++++++++++++++
@@ -40,18 +39,6 @@ index beab593e06eb..f932adf42dad 100755
  typedef uint8_t       bool;
  #endif
  
-diff --git a/src/occ_405/occbuildname.c b/src/occ_405/occbuildname.c
-index 10fdbe46e694..cbc30a63271f 100755
---- a/src/occ_405/occbuildname.c
-+++ b/src/occ_405/occbuildname.c
-@@ -34,6 +34,6 @@ volatile const char G_occ_buildname[16] __attribute__((section(".buildname"))) =
- 
- #else
- 
--volatile const char G_occ_buildname[16] __attribute__((section(".buildname"))) = /*<BuildName>*/  "op_occ_180904a\0"  /*</BuildName>*/ ;
-+volatile const char G_occ_buildname[16] __attribute__((section(".buildname"))) = /*<BuildName>*/  "op_occ_180914a\0"  /*</BuildName>*/ ;
- 
- #endif
 diff --git a/src/occ_gpe0/firdata/ast_mboxdd.c b/src/occ_gpe0/firdata/ast_mboxdd.c
 index 397a01db8f2c..a9d2c24df769 100644
 --- a/src/occ_gpe0/firdata/ast_mboxdd.c
